@@ -119,6 +119,35 @@ fields, and above all how it carries its sources.
     support, and by how precise a citation your users need to verify a claim. Don't promise a
     granularity your data can't back.
 
+- **Structured output — force the model to return a typed shape (JSON Schema), or accept free
+  text?** *(the LLM as a typed function, not a text box)*
+  - *Maturity:* the **shape** (a Pydantic/JSON-Schema model) belongs in v0 alongside the citation
+    structure; **enforcing** it on the model is due when a consumer downstream parses the output.
+  - *Applicability condition:* your **product consumes the output as data** (renders components,
+    iterates fields, feeds another system) rather than showing prose to a human. If the deliverable
+    is prose a person reads, free text is fine and a schema is overhead. The failure it removes: a
+    brittle parser (regex / second LLM) between "the model said something" and "the frontend renders
+    it" — a piece that breaks silently on any format drift (prompt edit, model update, provider
+    swap).
+  - *Mechanism (same idea, three packagings):* OpenAI **Structured Outputs** (native param),
+    Anthropic **forced tool-use** (a tool whose `input_schema` is the shape, `tool_choice` pinned),
+    others via an **aggregator**. A library (Instructor) unifies them and adds validation retries.
+    *Build-vs-buy tension:* Instructor is itself a provider-abstraction layer — if you already funnel
+    calls through an aggregation Router (Phase 4), verify the two compose rather than fight over the
+    seam, and beware **stacking two retry layers** (the library's + the Router's). With two providers
+    and an existing seam, forcing the schema as a tool through your own Router can be lighter than a
+    second abstraction.
+  - *Structural caveat — form is not truth (link to guardrails, Phase 5):* a schema guarantees the
+    **shape** of the answer, never its **correctness**. A `Citation{standard, clause}` with a perfect
+    shape says nothing about whether that clause exists or the model invented it with impeccable
+    formatting. For a traceability corpus this is the same **emitting ≠ verifying** split above:
+    structured output cleans up *emission* (typed `{answer, citations[]}` instead of citations buried
+    in prose), it does **not** do verification — that stays a later generation-quality phase.
+  - *Streaming interaction:* if the *whole* response becomes one structured object, there is nothing
+    to stream token-by-token (partial JSON is ugly). This is an argument for a shape where the long
+    generated text stays streamable and the structure (citations, metadata) is a single terminal
+    event — the same split the streaming node in Phase 4 already wants.
+
 ---
 
 ## Phase 3 — Bounded-context vertical slice (CAG) before retrieval
@@ -146,8 +175,33 @@ pipeline to debug in parallel.
   prompt builder so *static instructions* and *context block* are separately addressable now
   (same final string, separable parts). This is what makes the cache key in Phase 4 — and the
   retrieval swap in the RAG phase — a slot-fill rather than a refactor.
+- **Move the static instructions to a file artifact, not a string constant in code.** The prompt
+  is a software artifact: living in `app/prompts/…/system.md` (loaded once at module level) makes a
+  prompt-only change a **legible diff a non-coder can review in a PR**, editable without opening the
+  service. This is separate from — and cheaper than — a template engine (see decision point). The
+  *context* stays where the data lives (a static file in CAG, retrieval in RAG); only the
+  *instructions* (the contract with the model) move to the artifact. The final composed string is
+  unchanged, so it is a pure refactor.
+- **Guard a prompt refactor with a characterization snapshot.** Capture the composed prompt as a
+  golden snapshot *before* touching anything; after the move, assert byte-identical (the refactor
+  changed origin, not content); after a deliberate content change, update the snapshot — its **diff
+  in the PR *is* the review of the prompt change**. The snapshot then stays as regression. (This is
+  how "the prompt is reviewable like code" becomes real rather than aspirational.)
 
 ### Decision points
+
+- **Prompt structure: raw file vs. template engine (Jinja2/ERB/…).**
+  - *Applicability condition:* a template engine earns its weight only once the prompt has
+    **conditionals or variable interpolation inside the static block** (per-parameter branches,
+    `{% include %}` of few-shot sets). While the prompt is a single static text with the only
+    variable part (the context/query) composed in code, a file-read-to-string loader is enough — the
+    engine is a dependency (and an injection/escaping surface) with no benefit yet.
+  - *Trigger signal:* the first real branch in the prompt (e.g. a genuine output-format or
+    detail-level knob that changes instructions). Re-evaluate then, not before.
+  - *Note — delimiters (XML tags vs Markdown):* Anthropic attends to XML tags, OpenAI to Markdown
+    headers; both understand both. If the system prompt must stay **provider-agnostic** (Phase 4),
+    the delimiter style is part of that contract — changing it forces re-validation across the wired
+    providers, it is not a free cosmetic choice.
 
 - **Start with CAG, or go straight to RAG?** *(marquee decision)*
   - *Maturity:* bootstrap / MVP.
@@ -294,6 +348,21 @@ on the provider seam (Phase 1) and the output contract (Phase 2).
     model (`model_used`) in the key/value, which is heavier; the configured-model slot buys little.
     Accepted limit: after a model change, old entries serve until TTL expiry (mitigate by lowering
     TTL or flushing the namespace, not by re-adding the slot).
+  - *A presentation-only flag is not a key slot either.* A request flag that only controls what the
+    server *echoes back* (e.g. "include the injected context in the response for diagnostics") must
+    **not** enter the key — two requests differing only in it must still hit. Attach the diagnostic
+    payload *fresh* when serving, from the value recomputed for this request. *Fidelity caveat that
+    surfaces at the RAG phase:* recomputing the echoed context when serving a **hit** is faithful
+    only while that recompute is **deterministic** (a static slice). Once context comes from
+    non-deterministic retrieval, or a corpus that changed between the cached generation and the hit,
+    recomputing would echo something the cached answer was *not* built on — then fidelity requires
+    storing the context **inside** the cached entry, not recomputing it.
+  - *Order against guardrails (finer than "guardrails before the cache"):* run **input guardrails
+    before the lookup** (a hit must not bypass moderation — an attacker who knows a payload is cached
+    could trigger the hit to skip it), and run **output guardrails before the `set`** (only validated
+    answers enter the cache, so a hit is safe *by construction* and never re-pays the expensive
+    check). Decide whether a *filtered/degraded* answer is cacheable: fine if deterministic, a trap
+    if the degradation was a transient failure you'd be pinning for the whole TTL.
 
 - **Cache invalidation strategy.**
   - *Applicability condition:* for a **versioned corpus**, the correct answer changes when the
@@ -302,13 +371,46 @@ on the provider seam (Phase 1) and the output contract (Phase 2).
     the primary mechanism. Event-based invalidation, which generic material treats as the exception,
     is here the main mechanism.
 
-- **Semantic cache.** *(recorded as a fork even though it may not ship)*
-  - *Maturity:* later (needs a vector store — the embeddings phase).
-  - *Applicability condition:* frequent **reformulations of the same intent**, *and* a domain where
-    small lexical differences don't change the correct answer. A normative corpus **fails the second
-    condition**: "criticality B" vs "criticality C" are near-identical in embedding space but point
-    to different clauses — a semantic hit would serve the wrong norm with a confident face. May be
-    inadvisable here even when available, or require very high thresholds plus domain validation.
+- **Semantic cache — match on *meaning* instead of string equality.** *(a real win for the right
+  corpus; recorded as a full fork, since whether it ships is corpus-dependent)*
+  - *Maturity:* **scaling**, not MVP — it needs an embedding model and a vector store, so it lands
+    naturally in/after the embeddings phase. Standing it up earlier pulls that dependency forward.
+  - *Applicability condition (two clauses, both required):* (1) users **reformulate the same intent**
+    often (N phrasings of one question — the case exact-match misses entirely, since natural-language
+    keys are never byte-identical), **and** (2) the domain **tolerates small lexical differences** —
+    near-synonym phrasings must map to the same correct answer.
+  - *Where it is contraindicated (fails clause 2):* a **normative / legal / medical** corpus where a
+    one-token difference changes the correct answer. "criticality B" vs "criticality C" are
+    near-identical in embedding space but point to **different clauses** — a semantic hit serves the
+    wrong norm with a confident face, and because a hit skips generation, it also skips every
+    guardrail on the generation path. The failure is **structural** (the axis the cache groups on —
+    surface similarity — is orthogonal to the axis that matters — clause identity), so it is not a
+    threshold-calibration problem: raising the threshold until it's safe collapses it back to
+    exact-match. *Reopen path:* if the discriminating anchors (standard, criticality) move into
+    **structured parameters** (the deterministic bucket below) and only the free-text intent is
+    embedded, the risk drops — but that presupposes those knobs exist and retrieval to make them
+    mean something.
+  - *Key design — composite key:* a **deterministic bucket** (structured params + prompt version)
+    that partitions the space, and a **vector part** (the embedding of the free text) searched only
+    *within* a bucket. Same principle as the exact-match slots: homogeneous buckets let the threshold
+    be more aggressive safely, and putting `prompt_version` in the bucket means promoting the prompt
+    orphans old buckets automatically (TTL sweeps them — no manual invalidation).
+  - *Threshold is a product decision, not a constant.* Cosine similarity returns a score, not a
+    hit/miss; you pick the cut. Aggressive (~0.85) maximizes hits and risks false positives;
+    conservative (~0.95) eliminates them and loses hits; legal/medical/financial lean 0.95+. Roll it
+    out **log-only first** (compute the lookup, don't use it, log `(input, top-1 neighbor, score)`,
+    calibrate on real data), then enable. *(Same log-first discipline as guardrails, Phase 5.)*
+  - *Cost is a real ledger:* it adds embedding latency+cost on **every** request (hit or miss) to
+    save LLM latency+cost on hits — favorable only above a hit-rate floor (repetitive-query products
+    reach 40–60%; per-request-unique ones ~5% and it adds net latency). If unknown, log-only for a
+    week and measure.
+  - *Implementation — a dependency-appetite choice, not a quality one:* a managed layer (Redis
+    `LangCache`), a library abstraction (`redisvl`'s `SemanticCache`, or `langchain`'s
+    `RedisSemanticCache`), or hand-rolled over any vector store you already run (pgvector, Qdrant,
+    Pinecone). Pick by which dependencies you want to own. *(A blanket "no frameworks" stance is a
+    learning choice for a from-scratch project, not a Guide-level verdict — where a framework's
+    semantic-cache abstraction genuinely saves work and its coupling is acceptable, it is a valid
+    pick.)*
 
 - **Prompt caching (provider-native, e.g. Anthropic `cache_control`).** *(distinct from response
   caching above — it doesn't skip the call, it discounts the repeated-prefix processing)*
@@ -373,12 +475,29 @@ demonstrable*, it is not a second backend.
   declare the text field, and a hit sends no chunks) — the bug survived two briefs because every test
   asserted server state, none asserted client-readable output. The test that matters is *can the client
   read the response in all branches*.
+- **A test that asserts current behavior without asking whether it's correct is cement, not a safety
+  net.** Recurring failure across sessions: a test named for the property it should protect
+  (`…does_not_fabricate_citation`) whose body asserted the *fabrication* as expected — it passed
+  mechanically and gave false coverage over exactly the broken point. Wrong test *intent* is more
+  dangerous than no test: no test is a known gap; a green test encoding the bug is a gap that looks
+  covered. When writing a characterization test, assert the behavior you *want*, then make it pass —
+  don't enshrine what the code happens to do today.
 - **An inherited dependency is not a validated path.** Finding a library already in a sibling project's
   manifest doesn't mean the pattern that uses it was exercised there. Verify the path, not the presence.
 - **Don't reconstruct backend state in the frontend to display it.** If a diagnostic panel wants the
   active system prompt or injected context and the backend doesn't expose it, leave it a `TODO` and add
   a backend endpoint — reconstructing it client-side is the coupling-by-reimplementation the thin-client
   rule exists to prevent.
+- **The backend counterpart — expose diagnostic state by *wrapping* the real source, never by
+  re-deriving it.** When you add that endpoint, it must return the *same* value the model actually
+  received: the active-instructions endpoint returns the very constant the prompt builder composes
+  (not a re-read of the file), and the injected-context field reuses the *same* context string
+  already built for the prompt/cache-key that request (not a second derivation). Factor the builder
+  so the diagnostic path and the real path share one source; fidelity is then guaranteed **by
+  construction**, not by remembering to keep two copies in sync. Match exposure to naturalness:
+  instructions are static (a global `GET` is stable across CAG→RAG); context is per-request in RAG,
+  so it rides the query response (opt-in behind a flag — it's *content*, not metadata, and can be
+  large), never a global endpoint that RAG would invalidate.
 
 #### Decision points
 
@@ -392,5 +511,107 @@ demonstrable*, it is not a second backend.
     multimodal model demos. A framework whose specialization you don't use is cost, not benefit.
   - *Note:* for a product heading toward a real customer, a demo UI is not a product face — the custom
     frontend is a maturity node, deferred, and made cheap to reach by the thin-client decoupling above.
+
+---
+## Phase 5 — From working service to product (interface & content guardrails)
+
+A hardened service (Phase 4) answers reliably; it is not yet a *product*. This phase is about the
+layers that make it usable and safe for a non-expert end user: taking the prompt off the user, and
+validating **content** (not just shape). It sits on the output contract (Phase 2) and the provider
+seam (Phase 1). Some of it is MVP-cheap (prompt robustness), some is a scaling node (LLM-as-judge) —
+read the maturity field, don't adopt the whole pipeline at once.
+
+### Patterns & practices
+
+- **Where does the prompt live?** — the most useful architectural question when turning a chat
+  feature into a product. In a chat, the prompt lives in the user's textarea and product quality
+  becomes a function of how well each user prompts — that's a power-user tool, not a product. Move
+  the prompt to the **backend** (versioned, testable, route-able for cost): the user supplies
+  *parameters and content*, the backend composes the full prompt from a template. Corollary already
+  used in Phase 1/3 (thin client, prompt-as-artifact): the frontend sends structured input, not a
+  prompt.
+- **"Bake the affordance into the interface."** A bare textarea makes every user guess what the
+  product can do and how to phrase it; a form with concrete fields, a mode selector, and a verb-y
+  button teaches capability *and* guarantees a quality floor. This is the same move as prompt
+  robustness below, on the input side.
+- **Guardrails are defense-in-depth, ordered cheap→expensive.** No single guardrail covers the
+  space. Layer them so each case is rejected by the cheapest layer that catches it: regex/heuristics
+  (<1 ms, free) → a moderation classifier (~50–100 ms, free) → prompt robustness (zero runtime cost)
+  → a validation retry (a model call) → LLM-as-judge (another model call). Combined, they're cheap;
+  any one alone is porous.
+- **Every guardrail declares its failure policy — explicitly.** Three canonical policies:
+  **exception** (abort with a clear error — severe, non-degradable violations: PII, clear injection,
+  explicit toxicity), **fix-with-retry** (show the model its error and re-ask — recoverable: malformed
+  JSON, a failed cross-field check), **filter/degrade** (return a safe default — out-of-scope, low
+  confidence). *The most common production mistake is not choosing wrong, it's not choosing* — code
+  review of any new guardrail should ask "what happens when this fires?" and get one of the three as
+  an answer. Don't manufacture guardrails to "have all three": one well-chosen guardrail with one
+  declared policy beats three forced ones.
+- **Log-only before blocking.** Ship a new guardrail in log-only mode, watch what it fires on for a
+  week or two, tune thresholds on real false positives, *then* enable blocking. A moderation/validator
+  call returns a score, not a boolean — the threshold is a **product** decision. (Your Phase 4
+  structured logging is where log-only lives; a guardrail in log-only is one more structured event.)
+- **Content validation is the layer that "form ≠ truth" needs.** A schema-valid response can still be
+  a prompt-injection echo, out-of-scope, PII-leaking, or a hallucination with impeccable formatting.
+  Syntactic validation (Pydantic: types, ranges, cross-field coherence via a model-validator) is
+  cheap and unconditional; *semantic* validation (is it safe, in-scope, grounded, non-fabricated) is
+  the harder, often model-priced layer. Keep the split explicit: **emitting a citation is not
+  verifying it; a valid shape is not a true content** (the citation-verification layer is a distinct,
+  later generation-quality concern — don't let a schema's presence imply it's solved).
+
+### Decision points
+
+- **Where to sit on the interface spectrum** — `chat → chat+params → form/action → generative UI`.
+  - *Maturity:* a post-MVP product decision — you have a working single-shot endpoint and are turning
+    it into a product surface.
+  - *Applicability condition:* driven by how much **legitimate input variability** the task has.
+    Genuinely open, exploratory input (brainstorming, "explain X") → chat is correct. Finite,
+    consistency-demanding input (an estimate with fixed parameters) → form/action, prompt fully
+    abstracted. A **question-answering product over a corpus is a hybrid**: the question itself is
+    open natural language (it doesn't reduce to dropdowns), but *knobs around it* are finite (output
+    format, detail level, and — once retrieval exists — scope filters by document). Not chat-pure, not
+    a form: **open question + structured knobs**.
+  - *Note — knobs can be phased:* a knob is only real once the machinery behind it exists. A
+    "search only standard X" filter is meaningless until there's retrieval to filter; output-format
+    is available from day one. The interface matures with the modules underneath it.
+
+- **Guardrail tooling — by maturity and cost.**
+  - *Prompt robustness (Capa 3)* is the cheapest and often most effective, and it's **MVP**: give the
+    model explicit permission to say "I don't know," define scope in the system prompt, forbid
+    fabrication. For a grounded system this *is* the grounding instruction — it doubles as a guardrail.
+    Zero runtime cost.
+  - *Moderation API / regex heuristics* — MVP, cheap, for toxicity/injection/PII on user text. Frail
+    as a sole defense (a substring list of injection phrases is exactly the brittle heuristic to not
+    rely on alone); fine as one cheap layer. Applicability is domain-shaped: near-irrelevant for a
+    normative technical corpus, essential for open user-generated input.
+  - *Pydantic model-validators* — MVP, for internal-coherence rules the schema can't express.
+  - *Guardrails AI / LLM-as-judge* — a **scaling** node (a library dependency, or a second model call
+    per request). Adopt when Pydantic-plus-prompt no longer covers the semantic cases and the cost is
+    justified; don't reach for it by default when validators already in-house suffice.
+
+- **Signalling refusal on a grounded corpus — two refusal types, not one.** *(domain-flavored but
+  general to any grounded RAG)*
+  - *Applicability condition:* a system that answers **only** from provided material and must not
+    fabricate. Distinguish **out-of-domain** (the question isn't about your domain at all) from
+    **out-of-material** (a legitimate in-domain question the provided material doesn't cover). A pure
+    generator (the estimator) needs only the first; a **traceability** system needs the second — it's
+    the one that prevents a phantom citation when the corpus doesn't hold the answer. Both are the
+    *filter* policy; instructed in the prompt, not a Python validator (real grounding verification is
+    a later phase).
+  - *Bridge pattern until structured output — a natural marker phrase.* To act on a refusal (e.g.
+    suppress the candidate citation on it) before you have a typed refusal field, have the model
+    **begin the refusal with a fixed natural phrase** (`"Out of scope:"` / `"Not covered by the
+    provided material:"`) and detect it by prefix at the shared assembly point. Choose a *natural
+    phrase over a technical marker* deliberately: a technical token (`OUT_OF_MATERIAL:`) would have to
+    be stripped from the text, and on a streaming endpoint that means **buffering the stream start** —
+    streaming-only logic the "streaming is a deletable delivery layer" rule (Phase 4) forbids. A
+    natural phrase *is* the readable message: it streams as-is, detection happens on the assembled
+    text, not on bytes already sent to the client. **The streaming principle dictates the guardrail
+    mechanism.** It's a bridge — prefix detection is frail if the model doesn't emit the phrase
+    verbatim — that retires when structured output gives a typed refusal field. *(A related domain
+    trap: a candidate citation derived from the injected material and attached unconditionally becomes
+    a phantom citation on every refusal — and on a single-fragment CAG slice, refusals are the common
+    case, so the better the scope guardrail works, the more phantom citations it produces. Cut the
+    citation on detected refusal.)*
 
 ---

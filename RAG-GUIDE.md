@@ -363,6 +363,20 @@ on the provider seam (Phase 1) and the output contract (Phase 2).
     answers enter the cache, so a hit is safe *by construction* and never re-pays the expensive
     check). Decide whether a *filtered/degraded* answer is cacheable: fine if deterministic, a trap
     if the degradation was a transient failure you'd be pinning for the whole TTL.
+  - *The input-guardrail-before-lookup order is an **invariant, not an optimization** — and must not
+    depend on the cache algorithm.* The defense isn't "the key-collision attack is exploitable today"
+    (under exact-match it's practically impossible: a different input yields a different key → miss →
+    it *is* moderated). The defense is that **a security invariant must not rest on an accidental
+    property of another subsystem** (that the key is the exact text). Add key normalization
+    (lowercase/trim) or **semantic caching** and "a different input that hits the same entry" goes
+    from impossible to being the cache's *design* — the bypass then opens itself, silently, via an
+    unrelated change three phases later. Putting the guard before the lookup costs nothing now and
+    closes it by construction. Pin it with a regression test (a would-be-hit input that moderation
+    rejects is still rejected), not a comment — the same "works by design, not by today's
+    coincidence" discipline as the test-cementing-a-bug lesson above. Structure the input guards as a
+    **small ordered pipeline** even with one tenant (toxicity today), so the next layer (injection)
+    slots in without reworking the flow; each check declares its failure policy (moderation →
+    *exception*).
 
 - **Cache invalidation strategy.**
   - *Applicability condition:* for a **versioned corpus**, the correct answer changes when the
@@ -582,8 +596,17 @@ read the maturity field, don't adopt the whole pipeline at once.
     Zero runtime cost.
   - *Moderation API / regex heuristics* — MVP, cheap, for toxicity/injection/PII on user text. Frail
     as a sole defense (a substring list of injection phrases is exactly the brittle heuristic to not
-    rely on alone); fine as one cheap layer. Applicability is domain-shaped: near-irrelevant for a
-    normative technical corpus, essential for open user-generated input.
+    rely on alone); fine as one cheap layer. *Applicability is decided by the input surface, not the
+    corpus domain:* any public endpoint that accepts free user text justifies moderating the input,
+    however technical the subject matter — the domain doesn't control what a user types. Two honesties
+    to keep: (1) a hosted moderation API is a **network call to a provider**, not a local check — it
+    *adds* latency to every request (including cache hits), it does not save calls; its justification
+    is input hygiene, never cost. (2) **Toxicity ≠ prompt injection:** a toxicity classifier does not
+    catch attempts to subvert the system's instructions; that's a different detector. Adopting
+    moderation "to protect the input" covers one threat and leaves the other open — name it the
+    *toxicity* guardrail, not *the* input guardrail. Keep the moderation client **separate from the
+    completions provider abstraction** (it isn't a completion, has no fallback; routing it through the
+    same Router couples "which LLM answers" with "which requests get in").
   - *Pydantic model-validators* — MVP, for internal-coherence rules the schema can't express.
   - *Guardrails AI / LLM-as-judge* — a **scaling** node (a library dependency, or a second model call
     per request). Adopt when Pydantic-plus-prompt no longer covers the semantic cases and the cost is

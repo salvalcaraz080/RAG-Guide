@@ -89,6 +89,21 @@ downstream fork, so write them down.
 Define the **response schema before building retrieval**. Lock what an answer looks like — its
 fields, and above all how it carries its sources.
 
+> **Governing principle for a traceability system — the citable/context frontier.** Everything that
+> reaches the model splits into two epistemic classes: **material the answer is grounded in and may
+> cite** (the corpus — authority), and **everything else around the question** (history, user
+> attachments, profile knobs, distilled "facts" — context *about* the question, never citable as
+> source). A parallel frontier separates **generating** an answer from **verifying** it. These two
+> frontiers are the same rule seen twice, and they generate a recurring design test: *almost
+> anything the generic playbook solves by letting the LLM infer, adapt, remember, summarize, or
+> self-validate, a traceability system must instead solve with an **explicit parameter**, a
+> **deterministic invariant**, or a **separation of responsibilities**.* The reason is singular: the
+> product cannot let the LLM introduce **unverified text that affects fidelity**. Downstream nodes
+> that look unrelated — "history is a cache gate not a slot," "summary is contraindicated," "a knob,
+> not extraction," "tier adapts output not citations," "emitting ≠ verifying" — are all instances of
+> this one frontier. When a new feature blurs it (letting generated/echoed/summarized text sit where
+> cited material sits), that blur *is* the bug, however well-formatted the output.
+
 ### Patterns & practices
 
 - **If traceability is required (Phase 0), put a citations structure in the schema from v0** —
@@ -196,8 +211,13 @@ pipeline to debug in parallel.
     `{% include %}` of few-shot sets). While the prompt is a single static text with the only
     variable part (the context/query) composed in code, a file-read-to-string loader is enough — the
     engine is a dependency (and an injection/escaping surface) with no benefit yet.
-  - *Trigger signal:* the first real branch in the prompt (e.g. a genuine output-format or
-    detail-level knob that changes instructions). Re-evaluate then, not before.
+  - *Trigger signal (sharpened):* not "there's multi-turn" and not "there's a tier" per se, but the
+    first of either **partials reused across prompt variants** (`{% include %}` of a shared block
+    into two-plus templates) **or a real conditional branch inside the static block**. Multi-turn
+    history that is just prepended as messages does *not* branch the static prompt, so it does not
+    trip this; a per-tier template that shares a `_context.j2` partial *does*. Re-evaluate at that
+    point, not before — and when it trips, a hand-rolled `str.replace` loader stops being defensible
+    (partial composition is exactly what the engine buys).
   - *Note — delimiters (XML tags vs Markdown):* Anthropic attends to XML tags, OpenAI to Markdown
     headers; both understand both. If the system prompt must stay **provider-agnostic** (Phase 4),
     the delimiter style is part of that contract — changing it forces re-validation across the wired
@@ -218,6 +238,51 @@ pipeline to debug in parallel.
     — you're using a bridge whose expiry condition you already know. Choose the slice to be
     representative (e.g. a self-contained requirement that itself contains a cross-reference), so
     the slice exercises the structure retrieval will later have to handle.
+
+- **Enriching context at runtime from external sources — attachments, web search, business DB.**
+  *(recorded as a fork; for a traceability corpus most branches are pruned, but the reasoning is the
+  node)*
+  - *The real axis is not "where the context comes from" but **who decides it enters and whether it's
+    deterministic**.* **Pre-injection** (the system decides, before the call — an attachment fills the
+    same `context` slot retrieval will) vs **tool-call** (the model decides, inside an agentic loop —
+    web search, DB query). The second is an agent-phase change (function calling, M5), not a context
+    source you swap in; don't smuggle it into a CAG phase. And determinism gates the cache: an
+    attachment is deterministic given the file (fills the `context` slot cleanly); **web search is
+    non-deterministic** (a cached answer built on yesterday's search, served today, is a phantom
+    citation from cache via a new door); a **tool loop has no context *before* the call at all**, so
+    the `guards → cache → LLM` order stops holding as-is. Any dynamic content must also sit **after**
+    the static prefix, or it invalidates the provider prompt-cache on every request.
+  - *Rule 1 — dynamic context is **input, not program**.* External content is delimited and never
+    given to the model as instructions (classic injection). This is where the injection guardrail's
+    applicability condition actually bites: **"untrusted content of arbitrary size enters the prompt,"
+    not "there is user input."** A short, moderated question is one thing; an arbitrary attachment (or
+    a client-owned history) is another category — and delimiting with a tag is necessary but *not*
+    sufficient (the attacker closes your tag).
+  - *Attachments — multimodal vs local extraction is **not** a free choice for a traceability system.*
+    Two conditions close it: (a) **a fallback that can't accept the same input isn't a fallback** — a
+    multimodal PDF path crosses the provider seam (verify the aggregation layer even passes document
+    blocks rather than flattening them; don't assume), so if the primary takes the PDF natively and
+    the backup can't, the rotation doesn't save you. (b) **No parse, no coordinates** — the multimodal
+    model "saw" the file but you never parsed it, so you can't cite section/clause. Under mandatory
+    traceability, **local extraction is forced**, and the extraction code is the first piece of the
+    eventual chunking pipeline. (The generic "either is defensible" holds only for systems with
+    neither a fallback nor a citation requirement.)
+  - *Web search is **contraindicated** for a normative corpus* — a channel that pulls plausible
+    outside text into a system whose premise is "answer *only* from the injected material" is a
+    fabrication vector with a confident face (same shape as the semantic-cache contraindication). The
+    only web that matters (is there a newer standard revision?) is *offline acquisition*, not runtime
+    context.
+  - *Business-DB context — the AI service never touches the operational DB directly* (schema coupling,
+    over-broad credentials, duplicated business rules); it calls an authenticated HTTP endpoint that
+    applies the business's own rules. Keep the distinction sharp: **the vector store is the AI
+    service's knowledge base; the operational DB is the business's** — they speak by HTTP contract,
+    never a shared DB. For a single-service product with no business backend, this branch is N/A by
+    absent infrastructure.
+  - *Governing discipline:* start with the minimum context, measure, add dynamic context only on
+    evidence the system needs it — "more context can't hurt" is false (more tokens, more latency, more
+    injection surface). And **budget/truncation of dynamic context is not neutral**: truncating a
+    specification silences requirements (the same integrity failure as `finish_reason == "length"`),
+    and *if it doesn't fit, that non-fit is the trigger signal for retrieval*, not a budget knob.
 
 ---
 
@@ -246,6 +311,20 @@ on the provider seam (Phase 1) and the output contract (Phase 2).
   optimization. Never `except: pass` — a degraded path is logged, not silent. Reflect this in
   orchestration too (e.g. don't gate container startup on a `service_healthy` cache — that
   contradicts "degradable").
+  - *The degradability test (which policy does a dependency get?):* a dependency is degradable **iff
+    its absence changes the *cost* of the answer, not the *answer*.** Cache down → same answer,
+    slower → fail-open. Session/conversation state down → a follow-up gets answered without its prior
+    context → the *answer* changes → **fail-loud**. Moderation down → doesn't change a legitimate
+    answer, only whether a toxic one is blocked → fail-open **as a consciously documented exception**
+    (accepted security debt), not because the test says so. "Correctness degraded in silence" is the
+    cardinal sin (same family as the phantom citation); the fail policy is *derived* from whether
+    absence changes the answer, not chosen by taste.
+  - *The fail policy is a property of the **caller**, not of the datastore.* A store going down is
+    just an event; whether you degrade or abort is decided by the accessing code. One physical Redis
+    can serve a degradable tenant (cache) and a non-degradable one (session state) with opposite
+    policies. The hazard: the non-degradable tenant silently **inheriting the fail-open wrapper** of
+    the degradable one. Rule: never share the access wrapper between a degradable and a
+    non-degradable tenant, even on the same physical store.
 - **Shared-port stores are a cross-project contamination risk.** Any datastore on a default shared
   port (Redis 6379, Postgres 5432, …) can collide with *another project's* instance on the same
   machine. Two guards: (1) tests isolate from the real resource **by default** (opt-in to a real/
@@ -376,7 +455,35 @@ on the provider seam (Phase 1) and the output contract (Phase 2).
     coincidence" discipline as the test-cementing-a-bug lesson above. Structure the input guards as a
     **small ordered pipeline** even with one tenant (toxicity today), so the next layer (injection)
     slots in without reworking the flow; each check declares its failure policy (moderation →
-    *exception*).
+    *exception*). *Sharpened once multi-turn adds state:* the guardrail runs before **any effect** —
+    not just before the cache but before reading conversation state, resolving a session, or any
+    work at all. A malformed/malicious `session_id` must not trigger work before the *question* is
+    moderated. What was "guardrails before the cache" becomes "guardrails before the first side
+    effect," and the regression test moves with it (moderation is asserted to run before the store
+    is touched, not merely once).
+  - *Conversation history is a cache **eligibility gate**, not a key slot.* History disambiguates
+    the *question*; it does not change the *answer* the corpus holds — so it does not belong in the
+    key. Gate on **presence of injected history**, not presence of a session: `cache_eligible =
+    (len(history) == 0)`. Turn 1 of a session (empty history) is eligible and **shares the cache
+    entry** with the same question asked single-turn (same key → preserves the FAQ value where
+    caching actually pays). Turns 2+ (non-empty, per-conversation-unique prefix) **bypass get *and*
+    set** — caching a unique prefix never hits and only litters the store. Corollary that must not be
+    lost: on a turn-1 **cache hit inside a session, still append the turn** (using the cached answer
+    text as the assistant turn), or turn 2 loses the context of turn 1. *(Expiry: once query
+    condensation exists — rewriting a follow-up into a standalone question against history — the
+    condensed follow-up regains a cacheable identity and re-enters the cache keyed on the condensed
+    form. "Cache only the first question" is correct-for-now and temporary.)*
+  - *An evaluation mode must be able to **disable** the cache — and the cache is the evaluation
+    instrument's adversary.* A response cache exists to *suppress* the variance that quality
+    evaluation exists to *measure*; with the cache live, a consistency test gets hits and reports
+    variance ≈ 0, measuring the cache, not the model (a silent false positive). So disabling the
+    cache is *instrument correctness*, not convenience — and it composes into the same eligibility
+    predicate as the history gate (`cache_eligible = len(history) == 0 and not eval_mode`), one
+    decision site, not parallel branches. Disable **by environment/mode, not by a request flag**: a
+    request flag that turns off the cache is attack surface (force bypass, spike cost) and
+    contradicts "the system decides eligibility, not the client." The bypass reuses the *same*
+    "serve without cache" seam the degradable path already built (Phase 4 fault-tolerance) — a good
+    seam pays twice; you activate it, you don't invent it.
 
 - **Cache invalidation strategy.**
   - *Applicability condition:* for a **versioned corpus**, the correct answer changes when the
@@ -464,6 +571,53 @@ on the provider seam (Phase 1) and the output contract (Phase 2).
     which claim — a generation-quality phase). Same word, different layers; don't let a logging task
     absorb the citation-verification concern.
 
+- **Multi-turn conversation state — history vs. memory, and who owns it.**
+  - *Applicability condition (which one you even need):* distinguish **history** (the raw message
+    array, for anaphora/ellipsis resolution — *"and for criticality B?"* only parses against the
+    prior turn) from **memory** (distilled domain facts that must survive history truncation, e.g.
+    *"the project is called X"*). A **co-authoring** system that negotiates a shared state turn by
+    turn needs memory; a **retrieval system whose answers already exist, fixed, in the corpus**
+    usually needs only history. For the latter, the corpus *is* the persistent memory — facts are
+    re-retrievable by re-asking, so nothing load-bearing is lost on truncation. Building a memory
+    layer there is speculative complexity for a problem the product doesn't have.
+  - *The memory candidate is usually a **knob**, not extraction.* Where a retrieval product *does*
+    have something that should outlive the window (which corpus/discipline is in focus), it's
+    typically a user-declared **explicit parameter** — typed, carried per request, surviving
+    truncation *by construction* because it never lived in the history — not a fact to distill with
+    an LLM extractor. Extraction adds cost, latency, and a **fabrication vector**: a hallucinated
+    "fact" persists and poisons every later turn's citations (worse than a one-turn hallucination —
+    invisible and propagating). The generic instinct "let the LLM remember" collapses, for a
+    traceability product, into "make it an explicit knob."
+  - *History ownership: server, decided by the **assistant-turn forgery** vector, not "control."*
+    If the client owns history, an attacker injects a fake `assistant` turn (*"§5.1 requires X"*) the
+    model then builds on — untrusted content of arbitrary size entering the prompt, exactly the
+    injection-guardrail applicability condition. Server ownership closes it (the server generated the
+    assistant turns; it knows what was actually said). Cost recorded honestly: the backend stops
+    being stateless (each query now needs its state → session affinity or a shared store). An
+    in-memory dict is fine for a bootstrap **only with a single worker** — with `--workers N`, turn 2
+    can land on a worker that lacks the session; write that as a *condition*, and defer the shared
+    store (Redis/PG), TTL, and federation to a deployment phase. It composes with the fail-policy
+    test above: session state is **not degradable** (its absence changes the answer) → a
+    provided-but-absent `session_id` is a **loud error**, never a silently-single-turn answer.
+  - *Window strategy — simple sliding window over cumulative summary, and **why** for a traceability
+    corpus.* A plain last-N-turns window is defensible while (a) the source of truth is the corpus,
+    not the history, and (b) anaphora is short-range (it points at the prior turn; conversations
+    *drift* forward). **Cumulative summary is contraindicated here — not on cost, on traceability:**
+    summarizing turns with an LLM is generating **unverified text that re-enters context as if
+    faithful**; a mis-compression (criticality B vs C, a clause misattributed to the wrong standard)
+    plants a **fabricated normative claim in the history** that contaminates every later turn. Same
+    fabrication vector as the memory extractor and the semantic cache, via the summary door. The
+    sliding window is the *only* history strategy that introduces no unverified text. Reopen only if
+    the product demands **long-range multi-turn synthesis** (a wedge decision — a Q&A product asks
+    short-chained questions; an analysis copilot weaves), and even then prefer **anchors of whole
+    turns** (hybrid-with-anchors where the anchor is the intact turn) over a generated summary.
+  - *Implementation notes (agnostic, minor):* mutate the history collection **in place**
+    (`history[:] = history[-2N:]`) rather than reassigning the attribute, to avoid re-validating the
+    whole Pydantic model on the hot path; and beware a constant that encodes an **implicit
+    cardinality** (`-2N` assumes exactly two messages per turn) — it's silent debt the day a turn
+    gains a third role (a `tool` message), so annotate it with its *trigger condition*, not a vague
+    "fix later."
+
 ### Frontend / demo UI
 
 A UI belongs to this phase only as a **thin client** — it makes the service *usable and
@@ -479,9 +633,12 @@ demonstrable*, it is not a second backend.
   material — forfeits all three; it's testing a shortcut, not the product.)*
 - **"Conversational" UI ≠ multi-turn.** A visible chat history (session state) that is *not sent back
   to the model* is single-turn with a scrolling log — it maps onto a single-turn endpoint with no
-  schema change. Real multi-turn (sending prior turns as context) is a later, separate concern; don't
-  smuggle it in via the UI. Because the history is presentational, migrating the frontend stays cheap —
-  that cheapness is a property of the *scope* (single-turn) as much as of the HTTP decoupling.
+  schema change. Real multi-turn (sending prior turns as context) is a separate, backend concern (see
+  *Multi-turn conversation state* above): when it arrives, ownership of the history moves from the
+  frontend's presentational `session_state` to the **server**, and the frontend keeps only an opaque
+  `session_id`. Don't smuggle real multi-turn in via the UI. Because the *presentational* history is
+  cheap to migrate, that cheapness is a property of the single-turn *scope* as much as of the HTTP
+  decoupling.
 - **Validate a streaming contract by building the real consumer, not just server-side assertions.**
   "Did the server enter the right path?" (`cache_hit: true`, no `chunk` events) does **not** catch a
   delivery failure to the client ("can the client actually read the answer on *every* path?"). Witness:
@@ -636,5 +793,77 @@ read the maturity field, don't adopt the whole pipeline at once.
     a phantom citation on every refusal — and on a single-fragment CAG slice, refusals are the common
     case, so the better the scope guardrail works, the more phantom citations it produces. Cut the
     citation on detected refusal.)*
+
+- **Testing & evaluating a probabilistic component — two sovereign suites, not one with exceptions.**
+  - *The reframe:* `assert == expected` doesn't apply to LLM output; you test **properties**, not
+    equality (else: false negatives when the model says "16h" not "16", or false positives when
+    `len > 0` passes while the system returns "I can't help" to everything). But the deeper split is a
+    **second axis orthogonal to the hard/soft/judge pyramid: deterministic vs non-deterministic**,
+    and it partitions "testing" into two products. **Contract suite** (the code's): does the *code*
+    honor the contract — binary verdict, deterministic, **mocked, no network/model**, runs in CI,
+    blocks merge. Only the hard family (schema validity, ranges, invariants, assembly order, cache
+    gates) lives here, **with the model response mocked**. **Evaluation suite** (the developer's):
+    does the *LLM* produce quality — gradient verdict (score, distribution, trend), non-deterministic,
+    **real model + cache disabled**, run on demand/periodically, needs statistical analysis, does
+    **not** block merge. The soft/judge families live here. A "no network, mocked" rule is the rule of
+    the *contract* suite — it is not universal; naming the evaluation suite as sovereign is what keeps
+    the contract rule from looking like it was violated.
+  - *Evaluating a probabilistic component is a **first-class product function**, not an external
+    activity.* In deterministic software the test observes from outside and the system needn't know
+    it's under test. With an LLM under test, supporting an evaluation mode is *part of the system* —
+    for a traceability RAG, measuring fidelity *is* knowing whether the product works ("works" isn't
+    binary). Materialize it as a **single named mode** (`LLM_EVAL_MODE`) that declares *intent* and
+    lets the system *derive* the mechanics (cache off; later, content logging, sampling). A handful of
+    independent flags turns "being in eval mode" into a memorized ritual whose forgetting yields a
+    **silently invalid evaluation** — same failure family as a half-active cache. And the powerful
+    mode needs a **fail-fast guard**: refuse to start when the eval mode coincides with production (a
+    validator over the *relation between two config fields*, not one field) — the mode turns off
+    protections/optimizations, so accidental production activation is catastrophic.
+  - *Two domain-specific reframes:* (1) **contract tests must not depend on which provider answered**
+    — with a fallback, pinning one provider's output breaks the test when the other answers, which is
+    a normal path; test system properties, not model outputs. (2) In a traceability system the
+    **consistency metric is citation stability, not text stability** — "do N runs cite the same
+    clause?" beats variance of prose; and with a deterministic cache, consistency of *cached*
+    questions is an **invariant, not a statistic** (the cache is reproducibility of the cited answer).
+  - *What is deferred (don't graduate as done):* the serious evaluation content — golden datasets,
+    LLM-as-judge, faithfulness/RAGAS, a library like DeepEval — is a later generation-quality phase;
+    it needs retrieval and fidelity to evaluate. Define the mode and the two suites now; populate the
+    evaluation suite then. Family-1 contract tests need only pytest + Pydantic, no eval framework.
+
+- **Adapting output to a user profile ("tier") adapts generated output, not cited material.** *(by
+  negation — the useful form of tier for a retrieval system)*
+  - *Applicability condition:* the generic tier pattern (per-profile template + per-profile output
+    schema; adapt *structure*, not just *tone*) presumes the system **generates** the substance it
+    reshapes. A **retrieval system with mandatory traceability** *reports* the norm — the substance is
+    the source and is **invariant to the profile**: reformulating a clause for an "executive" either
+    quotes it verbatim (not adapted) or paraphrases it (unverified text under a normative citation —
+    fabrication). So tier here may only touch **the glosa and presentation around the citation**
+    (wrapper verbosity, explanation language, presentation format, and — once retrieval exists —
+    retrieval breadth), **never the citation itself**. Poorer than the generic pattern, and that
+    poverty is the traceability contract doing its job.
+  - *And the profile is another **explicit knob**, not inference:* like the focus-corpus knob, it's a
+    typed request/session parameter, not tone the model improvises. *The threat vector of a knob is
+    proportional to what it unlocks* — a knob that only controls glosa verbosity tolerates
+    client-ownership; one that unlocks cost or data does not (contrast history, where client-ownership
+    was unsafe because it lets forged turns *into the prompt*). The generic "never trust the client
+    with tier" is right for authorization/cost gating, gradient for presentation-only knobs.
+  - *Infra caveat:* the article's persistence+propagation layer (a `users.tier` column, JWT/header
+    propagation) presumes a business backend that a single-user demo doesn't have — N/A by absent
+    infrastructure, same as the business-DB mechanism below. And a tier that dispatches a whole
+    *pipeline* (not just a template) is an agent-phase concern; keep the dispatch point at the seam so
+    you don't close that door, but don't build it now.
+
+- **Verifying citations (generation-quality phase, deferred) — the canonical shape is
+  generation/verification separation.** *(forward pointer, not an implemented node)* The
+  emitting≠verifying split (Phase 2) is closed, when its phase arrives, by separating **generation**
+  from **verification** in distinct calls (Self-Refine; and the three-role Actor/Critic/Boss, where
+  splitting *evaluation* from *decision* breaks the pure-Self-Refine failure modes: infinite
+  refinement and early-confirmation bias). In a retrieval system, "criticize the output" *becomes*
+  "verify the citation": an Actor generates answer + candidate citations, a Critic checks each claim
+  against the clause it cites, a Boss accepts / re-generates / suppresses unverifiable citations. An
+  `{answer, citations[]}` contract kept separate from v0 is already compatible with this — nothing to
+  undo. Maturity: it earns its place only when the error cost is high, the evaluation criteria are
+  clear, and the extra latency is tolerable; it is not an MVP node and does not graduate as
+  implemented until that phase.
 
 ---

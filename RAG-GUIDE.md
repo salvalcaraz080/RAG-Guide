@@ -286,12 +286,18 @@ pipeline to debug in parallel.
 
 ---
 
-## Phase 4 — Production-hardening the service (provider robustness, cache, streaming, observability)
+## Phase 4 — Production-hardening the service (provider robustness, caching, streaming, observability)
 
 Once the vertical slice answers correctly, these are the layers that turn a working endpoint into
 a service that survives contact with real use. None of them changes *what* the answer is — they
 change availability, cost, perceived latency, and your ability to see what happened. They all sit
 on the provider seam (Phase 1) and the output contract (Phase 2).
+
+> **Because none of them changes the answer, every one of them is also *removable*.** That cuts both
+> ways: it's what lets you add them cheaply, and it's what obliges you to re-check, at each phase
+> change, that each one still earns its keep. The response-caching node below is a worked example of
+> the second half — adopted on a valid trigger, retired when the trigger stopped holding. Treat a
+> *Trigger signal* as having an exit condition, not just an entry one.
 
 ### Patterns & practices
 
@@ -341,10 +347,13 @@ on the provider seam (Phase 1) and the output contract (Phase 2).
   only changes *how* the result is delivered. Consequence: never put business logic that exists
   *only* in the streaming path. If streaming misbehaves, it deletes cleanly — that's the design
   criterion, because streaming is UX, not correctness.
-- **The cache decides whether there's a stream at all.** A response cache sitting above the
-  provider layer means a hit never calls the model — so there is nothing to stream. Look up cache
-  first; on hit, return whole; only on miss open the stream. Cache and streaming don't interact
-  beyond this: the cache decides *if* the request even enters the streaming path.
+- **Any layer that can answer without calling the model decides whether there's a stream at all.**
+  A response cache above the provider layer is the canonical case: a hit never calls the model, so
+  there is nothing to stream. Look it up first; on hit, return whole; only on miss open the stream.
+  They don't interact beyond this — that layer decides *if* the request even enters the streaming
+  path. *(Generalize past the cache: a refusal short-circuit, a stored answer, or a guardrail
+  rejection has the same shape. What matters is the ordering — "can this be answered without
+  generation?" is resolved **before** the transport decision, never inside the stream.)*
 - **Truncation is an integrity failure, not a cosmetic notice — when traceability is mandatory.**
   `finish_reason == "length"` may have cut the answer before its citation, yielding a normative
   claim with no anchor. Detect it and mark the response unreliable; do **not** try to prevent it by
@@ -406,13 +415,33 @@ on the provider seam (Phase 1) and the output contract (Phase 2).
     universally — an aggregation layer uniforms the transport, but each model reacts differently to
     the same prompt. Re-validate when a new provider enters.
 
-- **Response caching — exact-match.**
+- **Response caching — exact-match.** *(Closed node — built in the CAG phase of the ECSS project,
+  then **removed entirely** at the RAG transition. Kept as recorded knowledge, not as a live
+  recommendation. Read the retirement lesson first: it changes when you'd take this branch at all.)*
+  - *Retirement lesson (the durable one):* an exact-match response cache is **MVP-cheap to build but
+    not cheap to carry**. Its applicability condition (observed hit rate above ~20%) is not a
+    one-time gate — it must be **re-evaluated at every phase change**, because the traffic that
+    justified it can disappear without the cache disappearing with it. In a **single-user product**
+    the only places with a real hit rate are the demo and the evaluation suite, not the traffic; and
+    the evaluation suite is precisely where the cache must be *disabled* (see the eval-mode bullet
+    below). Building it in the CAG phase was still the right call — **for what it forced, not for the
+    hits**: it forced separating static instructions from injected context, it forced the
+    guardrail-before-any-effect ordering, it forced the history-as-gate insight, and it forced the
+    eval-mode seam. All four outlive it. At the transition to dynamic retrieval its effort/benefit
+    ratio inverted (see the key-design caveat below) and it was deleted, not parked. *If a future
+    deployment with real users shows a hit rate that justifies it, rebuild it from this node — that
+    is what this node is for.*
   - *Maturity:* MVP-cheap once inputs repeat.
   - *Applicability condition:* a **deterministic** task where repetition is desirable (not creative
     generation). For a **normative/traceability corpus this is stronger than cost savings**: an
     identical query returning an identical, identically-cited answer is an *auditability* property,
-    not just a latency win.
-  - *Trigger signal:* observed repeated inputs (hit rate above ~20% justifies the infra).
+    not just a latency win. **Second clause, learned the hard way:** enough *distinct users asking
+    overlapping questions* for repetition to exist at all. The auditability argument justifies the
+    *design* of the key; it does not, by itself, justify carrying the infrastructure.
+  - *Trigger signal:* observed repeated inputs (hit rate above ~20% justifies the infra). **Re-check
+    this signal at each phase change, not only at adoption** — a decision point with a dynamic
+    trigger has a dynamic *exit* too, and nothing else in the system will tell you the trigger
+    stopped holding.
   - *Key design (the core decision):* build the key from **explicit slots** —
     `question + system_prompt + context + corpus_version` — and keep `context` and `corpus_version`
     as **separate slots even when static today**. This is why you'd hand-roll the cache instead of
@@ -421,6 +450,18 @@ on the provider seam (Phase 1) and the output contract (Phase 2).
     context is dynamic, would serve a stale answer built on chunks retrieval would no longer
     return — a **phantom citation served from cache**, the exact failure a traceability system
     exists to prevent.
+  - *Correction — the above generalized past its evidence.* "Populating the `context` slot is a fill,
+    not a redesign" was verified true **for getting to the end of the CAG phase**, and was written as
+    if it held into the RAG phase. It does not. Once context comes from retrieval, the `context` slot
+    is **redundant or harmful**: redundant because retrieval is a deterministic function of the
+    question and corpus version (so the slot adds no discrimination the other slots lack), and
+    harmful because you must now **run retrieval before you can build the key** — the flow inverts
+    from `lookup → retrieve` to `retrieve → lookup`, which throws away the cache's main benefit
+    (skipping the expensive work) and keeps only the generation savings. The cheap fill turned out to
+    be a re-architecture of the request flow. *This is a worked example of the failure this guide
+    exists to police: knowledge converged from one phase's evidence, stated at a confidence that
+    covered phases not yet reached. When a node says "this will be a cheap fill later," treat the
+    "later" as untested until the later phase actually tests it.*
   - *What is *not* a good key slot:* the **configured** model. It gates on `settings.LLM_MODEL`
     (rarely changed) yet doesn't protect against the real risk — a *fallback*-served response
     getting cached and later served once the primary recovers. That would need the *responder's*
@@ -460,7 +501,11 @@ on the provider seam (Phase 1) and the output contract (Phase 2).
     work at all. A malformed/malicious `session_id` must not trigger work before the *question* is
     moderated. What was "guardrails before the cache" becomes "guardrails before the first side
     effect," and the regression test moves with it (moderation is asserted to run before the store
-    is touched, not merely once).
+    is touched, not merely once). **This bullet outlives the cache entirely** — once the cache is
+    removed the invariant is unchanged ("before the first side effect" never mentioned the cache),
+    and its regression test keeps passing without edits. That is the tell that it was a real
+    invariant and not a property of the cache: *the cache was the occasion that surfaced it, not its
+    subject.*
   - *Conversation history is a cache **eligibility gate**, not a key slot.* History disambiguates
     the *question*; it does not change the *answer* the corpus holds — so it does not belong in the
     key. Gate on **presence of injected history**, not presence of a session: `cache_eligible =
@@ -483,17 +528,33 @@ on the provider seam (Phase 1) and the output contract (Phase 2).
     request flag that turns off the cache is attack surface (force bypass, spike cost) and
     contradicts "the system decides eligibility, not the client." The bypass reuses the *same*
     "serve without cache" seam the degradable path already built (Phase 4 fault-tolerance) — a good
-    seam pays twice; you activate it, you don't invent it.
+    seam pays twice; you activate it, you don't invent it. *Survives the cache in weakened form:* the
+    **mode** (an environment-level switch that puts the system in a state fit to be measured, with a
+    fail-fast guard against enabling it in production) is the durable part and stays; "what the mode
+    disables" is whatever suppresses variance at the time. With the cache gone the mode has nothing
+    to disable **yet** — keep it, because provider-side prompt caching, memoized retrieval, or a
+    reranker cache each re-create the same adversary later.
+  - *What did **not** survive, and is the honest cost of the retirement:* the exact-match cache was
+    also the only mechanism making an identical repeated query return a byte-identical, identically
+    cited answer. Removing it means **auditability of repeated queries now rests on model determinism
+    alone** (i.e. not at all). If that property is ever required contractually, it comes back as a
+    requirement — and it is an argument for *storing answers*, not for caching them to save cost.
+    Naming what a deletion costs is part of the deletion.
 
-- **Cache invalidation strategy.**
+- **Cache invalidation strategy.** *(Closed with the node above; kept for the corpus-versioning
+  insight, which is independent of caching.)*
   - *Applicability condition:* for a **versioned corpus**, the correct answer changes when the
     *corpus* changes (a new standard revision), not on a time schedule. Prefer **invalidation by
     corpus version** (a `corpus_version` slot in the key) over pure TTL; TTL is the safety net, not
     the primary mechanism. Event-based invalidation, which generic material treats as the exception,
-    is here the main mechanism.
+    is here the main mechanism. *The durable half:* a normative corpus needs an explicit **corpus
+    version identifier** regardless of whether anything caches — it is what lets any derived artifact
+    (index, embeddings, stored answers) be tied to the corpus revision it was built from.
 
 - **Semantic cache — match on *meaning* instead of string equality.** *(a real win for the right
-  corpus; recorded as a full fork, since whether it ships is corpus-dependent)*
+  corpus; recorded as a full fork, since whether it ships is corpus-dependent. **Not taken here** —
+  contraindicated on clause 2 below, and the exact-match retirement above raises the bar further:
+  the traffic that would feed any cache didn't exist.)*
   - *Maturity:* **scaling**, not MVP — it needs an embedding model and a vector store, so it lands
     naturally in/after the embeddings phase. Standing it up earlier pulls that dependency forward.
   - *Applicability condition (two clauses, both required):* (1) users **reformulate the same intent**

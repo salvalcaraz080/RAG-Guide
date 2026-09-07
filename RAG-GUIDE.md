@@ -100,9 +100,11 @@ fields, and above all how it carries its sources.
 > **deterministic invariant**, or a **separation of responsibilities**.* The reason is singular: the
 > product cannot let the LLM introduce **unverified text that affects fidelity**. Downstream nodes
 > that look unrelated — "history is a cache gate not a slot," "summary is contraindicated," "a knob,
-> not extraction," "tier adapts output not citations," "emitting ≠ verifying" — are all instances of
-> this one frontier. When a new feature blurs it (letting generated/echoed/summarized text sit where
-> cited material sits), that blur *is* the bug, however well-formatted the output.
+> not extraction," "tier adapts output not citations," "emitting ≠ verifying," and the indexing-phase
+> trio "the embed-text is not the cite-text," "the internal index key is not the citation coordinate,"
+> "no chunk mixes authority grades" — are all instances of this one frontier. When a new feature blurs
+> it (letting generated/echoed/summarized text sit where cited material sits), that blur *is* the bug,
+> however well-formatted the output.
 >
 > **Refinement — citable material has two authority grades, not one.** "Cite verbatim, never
 > paraphrase" is too strong as a blanket rule; the grade of the *source* decides both whether the
@@ -266,6 +268,20 @@ different stage.
   from trusting it beyond what it measures — the "constants without false authority" rule applied to
   an identifier. Any derived artifact (parsed JSON, embeddings, stored answers) should be tie-able to
   the `corpus_version` it was built from.
+  - *Corollary — a human label is not an invalidation key; fingerprint the real inputs.* Because
+    `corpus_version` names the declared *set*, it does not move when the *processing* changes under a
+    fixed set: three later parser changes altered the output while `corpus_version` stayed
+    `{same}`, and derived chunks from before and after carried the same label while being different.
+    The label is for humans (citation, manifest); **staleness detection is a separate mechanism** — a
+    **content fingerprint** stored on each derived artifact, a digest over *what the stage actually
+    consumed* (for chunks: the processed content; for embeddings: the embed-texts **plus model and
+    params**, since the same text under another model is another vector). A derived artifact is stale
+    ⇔ the fingerprint of its current input ≠ the one it recorded. **The fingerprint chains**: each
+    stage digests its own input, and since one stage's input is the previous stage's output, a change
+    anywhere upstream propagates as a changed input downstream — no manual "bump the version" (that is
+    *true by discipline*, the thing this replaces with *true by construction*). And the check is
+    honest about ignorance: a three-state `is_stale()` returns **`None`** when it can't know (no
+    artifact, or no fingerprint recorded) — a "don't know" must not disguise itself as "it's fine."
 
 - **Immutable-source / derived-staging directory split.** `raw/` (exactly what the server gave,
   immutable, one writer) → `parse_ready/` (a single homogeneous input dir for the parser — native
@@ -340,6 +356,109 @@ different stage.
   what metadata it can carry) and extractor validation (are the references even reliable?) exist —
   deciding earlier pre-empts the fork. *Signal it's the wrong tool:* the graph object is built but
   production only ever consumes the flat adjacency.
+  - *Sub-fork resolved (graph object vs. adjacency index):* if runtime is 1-hop, an adjacency index
+    built from the reference list (an in-memory dict) beats a graph object (`nx.DiGraph`) — the graph
+    object is not a runtime dependency; keep it, if at all, for offline tooling/multi-hop analysis and
+    off the hot path. What's built at chunk time to make *any* of these possible is a **ref-ready
+    chunk**: it carries its own clause-ID plus its outgoing references resolved to native-granularity
+    target-IDs, and stays **agnostic to how retrieval consumes them** — the material is the same for
+    adjacency, metadata, or the third option below. (Populating those references is itself gated on
+    the extractor's validation — don't fill the slot from a stale/unvalidated extractor.)
+  - *Third fork the original framing missed:* the choice is not only "graph vs. metadata" but "graph,
+    metadata, or **bake cross-reference awareness into the embedding**" (Contextual-Retrieval-style:
+    the embed-text of a chunk names what it references, so a query about the referenced thing retrieves
+    it **without traversing** anything). It doesn't let you *walk* references at query time, but it
+    dissolves part of the need to. Records the fork; the decision stays open and corpus-dependent.
+
+---
+
+## Phase 2.7 — From citable artifact to retrieval index (chunking & embedding)
+
+The data pipeline's continuation of Phase 2.5: the parsed, citable artifact becomes the vector index
+retrieval will query (parse → **chunk → embed** → index). It shares the data layer's governing
+failure mode (correctness degraded in silence) with a sharper twist proven here: **content can be
+complete and still wrong** — the parts all present, the *relation between them* lost. Placed next to
+the data layer because it is that pipeline's continuation and inherits its method; in *time* you
+bootstrap the answer loop with CAG (Phase 3) over a bounded slice first and build this full index
+only when the slice stops being enough.
+
+### Patterns & practices
+
+- **Dispatch chunking by content anchor, not by document type.** The anchor (an atomic unit like a
+  requirement vs. a prose section) is **mixed within one document** — a normative standard holds both
+  requirements and section prose; some documents hold only sections. Run each chunker over every
+  document and let it emit its own anchor; routing by document *type* drops whatever anchor that type
+  "isn't." Authority travels with the **content** (an atomic unit inside an informative annex is
+  informative), never deduced from the document type.
+- **The chunk carries embed-text and cite-text as separate fields** *(instance of the Phase-2
+  frontier)*. `embed_text` = a static contextual header + the verbatim source (enriched so it's
+  retrievable in isolation); `cite_text` = the verbatim source **only**, clean. If citation extraction
+  ever reads `embed_text`, the synthetic header gets "cited" — the blur *is* the bug.
+- **The contextual header is static and deterministic — not LLM-generated.** Built from parent
+  fields you already hold. It wins on cost *and* on **reproducibility** (same input → same embed-text →
+  same vector), which an LLM contextualizer forfeits by injecting non-determinism into the index.
+  Identifiers (clause/standard IDs, version) stay **out of the vector** (embeddings are blind to them)
+  and live in filterable metadata.
+- **Don't flatten structure at chunk time either.** The parser preserved nesting/indentation because
+  a flattened hierarchical list *asserts something different* (six sibling states vs. two with
+  sub-states); the chunker must not re-flatten it when composing `embed_text`/`cite_text`. Fixing
+  faithfulness upstream and re-breaking it here is the same defect, one layer down.
+- **A qualifier bound to a unit travels with that unit, not as a sibling.** A paragraph that qualifies
+  an atomic unit (its aim, its expected output) belongs *in that unit's chunk*, under its coordinate —
+  treated as free-standing section prose it decouples from what it qualifies and fuses with its
+  neighbours. (The binding is a structural association the parser owns; that it's citable is a
+  contract decision.)
+
+### Decision points
+
+- **Model choice — take a standard model; don't run a tournament unless measurement demands it.**
+  *Verify currency at decision time* (Phase 1). Keep it behind the seam + fingerprint so it stays
+  reversible; a full model benchmark before retrieval even exists is over-engineering. What you *do*
+  run is the domain probe below — which verifies the model isn't blind to your critical distinction,
+  a different thing from picking the best model.
+- **Embedding determinism ≠ chunking determinism — don't test the wrong one.** Chunk generation is
+  deterministic (test by equality). The embedding API may return small numerical variation between
+  calls, so its guarantee is **input-identity** (the fingerprint), not output-equality; a
+  vector-equality test across runs is a green-passing test that will fail someday for reasons unrelated
+  to the code. Two stages of one pipeline with two classes of guarantee — say which is which out loud,
+  so no one assumes the strong one where only the weak holds.
+- **Reference-target addressing — resolve to native granularity by ID-component prefix.** A
+  reference's target granularity is set by the *reference* (a clause, a whole section, a table), not
+  chosen by you; make the citation ID **prefix-addressable by component** so "all of §5.2" is a
+  component-prefix match — never a string prefix (`"5.20"` is not under `"5.2"`). This yields cheap
+  parent-child addressing with no physical parent index.
+- **Measure the representation before building retrieval on it — the domain probe.** Before indexing,
+  embed a handful of **real** domain pairs (built from the corpus, not hand-written), including a
+  **trap pair**: two texts whose entire distinction is a bare identifier. Read the *structure* (does
+  the trap pair sit below the should-be-similar pairs?), not the absolute number. Catching a collapse
+  here reads it correctly — as a property of the source text the dense representation can't capture;
+  the identical finding surfacing later in a retrieval evaluation reads as "retrieval is broken" and
+  burns weeks tuning k, reranking, and prompts. **Measuring a layer's property before the next layer
+  is built separates "the model can't" from "my upper layer is misconfigured."**
+- **Dense-only vs. hybrid retrieval — hybrid is a *measured requirement*, not a default, when the
+  corpus's critical distinction lives in exact-match identifiers.** *(forward pointer — the hybrid
+  mechanism is a later retrieval phase; only the **measurement** graduates now.)* Dense embeddings
+  compress *meaning* and discard exact lexical identity; a corpus whose discriminating tokens are
+  identifiers or rare jargon (criticality B vs. C, clause/standard IDs) has its distinction exactly
+  where dense is blind and lexical search (BM25) is strong — the two are complementary, not ranked.
+  - *Applicability condition (static):* the discriminator between confusable clauses is **lexical-exact,
+    not semantic**. (A corpus whose distinctions are semantic is served by dense alone.)
+  - *Trigger signal (dynamic):* the trap pair's dense similarity does **not** fall below the
+    should-be-similar pairs (measured on a real ECSS pair: 0.98 — *above* them, two tokens differing in
+    42).
+  - *Honest limit:* the probe measured the **representation** collapsing the distinction; that
+    **retrieval** then fails is highly probable but is confirmed only with query-side embedding, in the
+    retrieval phase. It is not an MVP node and the mechanism is deferred — but because the corpus
+    condition is known *now*, don't choose a dense-only index design that forecloses adding lexical
+    search later.
+
+*(Techniques excluded by prior nodes, restated at their point of use: chunking that rewrites the
+source — propositional/LLM decomposition, cluster chunking that loses the source location — is out
+for **normative** material by the traceability and authority-grade rules of Phase 2; it may be
+admissible for **informative** material, on cost/benefit. The embedding seam is the Phase-1 seam
+applied to a second provider surface: the frontier of **one request**, with batching left to the
+caller as a rate-limit policy; the derived vector artifact is stamped per the fingerprint corollary
+in Phase 2.5.)*
 
 ---
 
@@ -1138,5 +1257,39 @@ way — mostly in the data layer, but they generalize.
   caught. *Audit what appears to work* — the absence of visible dirt is not evidence of correctness,
   it's the removal of the suspicion that would make you look. It's the course's "vectorize last, not
   first" pushed one step earlier: before you *handle* the data, verify it's the data you think it is.
+  - *Generalized across layers — measure each layer's real property before building the next on it,
+    against an oracle appropriate to that layer.* Every layer rests on a property of the one below
+    that theory assumes and the real world may not honor. **Parsing:** structural fidelity — verify
+    against the **render**, because *verifying against the text is not verifying against the meaning*:
+    a parser can have every string-equality invariant green and still assert something else, because
+    the document means with visual structure (numbering, indentation, nesting, which paragraph
+    qualifies which) that plain text doesn't carry. A flattened list and text pulled out of a floating
+    box both pass "200/200 chars literal" while saying the wrong thing. **Embedding:** representation
+    discrimination — verify with a **domain probe** (the trap pair) that the model separates what the
+    system must distinguish. The absence to hunt is never only *missing* content; it's a *relation*
+    that the layer silently failed to preserve.
+
+- **A plausible-but-false artifact is the dominant silent failure — and it recurs in one shape.** A
+  string-prefix "descendant" test (`"5.20".startswith("5.2")`), a batch response trusted in arrival
+  order (each item gets its neighbour's vector), a match key built from repeated content (invents
+  correspondences and reports movement where there is none): each produces output that is
+  **shape-consistent and content-false**, invisible to any check downstream. Two rules fall out.
+  *Where a reliable structural order exists, key on position, not on content* — a content-derived key
+  in a repetitive corpus fabricates matches, and in the direction that most alarms (reporting
+  re-anchoring that didn't happen). *And compare against the canonical structure by component, not by
+  surface.*
+
+- **Verification has its own failure modes — a green check can be a check that never ran.**
+  *Resolving a discrepancy is not passing the test:* explaining why an anomaly *looks* wrong (a copy
+  error in the source) does not confirm the thing the test asked; a verification that stops when the
+  anomaly is "explained" closes a control without executing it. *Some verifications are
+  order-sensitive:* a tool that compares on-disk state against a fresh run only means something *before*
+  you overwrite the disk — run it after and it reports 0 because you erased the evidence. *A test that
+  mocks the frontier does not test the wiring up to the frontier:* injecting the client leaves the
+  path from config to seam unexercised, so a seam reading the wrong config source passes every mocked
+  test and fails only on first real run (and silently, if the wrong value happens to match). *A small
+  count still demands inspection — rare is not nonexistent:* "5 of 1455, negligible" and "0, the regex
+  false-matched all 5" are the same decision reached for opposite reasons, and only one leaves a true
+  belief behind.
 
 ---

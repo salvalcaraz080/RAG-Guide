@@ -422,6 +422,14 @@ only when the slice stops being enough.
   vector-equality test across runs is a green-passing test that will fail someday for reasons unrelated
   to the code. Two stages of one pipeline with two classes of guarantee — say which is which out loud,
   so no one assumes the strong one where only the weak holds.
+  - *Refinement (measured when adding a chunk field later) — each stage's fingerprint digests its own
+    **input**, and a stage with two consumers needs two keys.* Scope the invalidation key to what the
+    consumer consumes (the parsed documents for the chunker; the embed-text for the embedder), not to
+    the chunk's whole output record. Then adding a non-embedded **identity** field to the chunk moves
+    *neither* fingerprint — the vectors stay valid, no re-embed — and "must I re-embed?" stays owned by
+    the embedder's own key. A key over the whole record would fire a **spurious re-embed on an
+    identity-only edit** — the same identity-vs-content conflation `embed≠cite` warns against, one level
+    up.
 - **Reference-target addressing — resolve to native granularity by ID-component prefix.** A
   reference's target granularity is set by the *reference* (a clause, a whole section, a table), not
   chosen by you; make the citation ID **prefix-addressable by component** so "all of §5.2" is a
@@ -446,11 +454,14 @@ only when the slice stops being enough.
   - *Trigger signal (dynamic):* the trap pair's dense similarity does **not** fall below the
     should-be-similar pairs (measured on a real ECSS pair: 0.98 — *above* them, two tokens differing in
     42).
-  - *Honest limit:* the probe measured the **representation** collapsing the distinction; that
-    **retrieval** then fails is highly probable but is confirmed only with query-side embedding, in the
-    retrieval phase. It is not an MVP node and the mechanism is deferred — but because the corpus
-    condition is known *now*, don't choose a dense-only index design that forecloses adding lexical
-    search later.
+  - *Honest limit (now closed — graduated in Phase 3.5):* the probe measured the **representation**
+    collapsing the distinction; that **retrieval** then fails was **confirmed query-side in Phase 3.5**,
+    where the hybrid mechanism was built and measured. The forward-looking half held — because the
+    corpus condition was known at index time, the dense index design left room for the lexical channel,
+    so adding it was a slot-fill, not a redesign. *What the probe could not predict, and Phase 3.5
+    measured:* the fix works via lexical **repetition density** (not the shared identifier tokens), and
+    it **helps identifiers/tables while hurting generic queries** — so the live lever is fusion
+    weighting, not the hybrid on/off choice. See Phase 3.5.
 
 *(Techniques excluded by prior nodes, restated at their point of use: chunking that rewrites the
 source — propositional/LLM decomposition, cluster chunking that loses the source location — is out
@@ -580,6 +591,152 @@ pipeline to debug in parallel.
     injection surface). And **budget/truncation of dynamic context is not neutral**: truncating a
     specification silences requirements (the same integrity failure as `finish_reason == "length"`),
     and *if it doesn't fit, that non-fit is the trigger signal for retrieval*, not a budget knob.
+
+---
+
+## Phase 3.5 — Retrieval: replace the CAG context slot with vector search
+
+The CAG→RAG substitution the seam (Phase 1) was built for: the `context` slot stops being a static
+slice and becomes the top-k of a semantic search over the Phase-2.7 index. Build it as a
+**standalone, measurable retrieval layer first** — a `/search` that embeds a query and returns cited
+chunks — and wire it into generation only afterwards (that wiring is the generation phase; a
+standalone retriever keeps the data objective from tangling with the generation one). The **starting
+index is exact (sequential scan), not approximate** — see the marquee decision below.
+
+### Patterns & practices
+
+- **Add a vector store on two independent axes — and know which one is driving.** What forces a real
+  store and what forces a *fancy index* are different questions. **The four properties** —
+  persistence, concurrency, joins with relational data, transactions — decide whether you need a store
+  at all (an in-process array dies with the process, diverges across replicas, can't join typed
+  metadata, can't roll back a partial ingest). **Scale** decides whether you need an *ANN index* on
+  top. They don't move together: a small corpus can still need the store (for the joins and the
+  transaction), and a stored corpus can still run exact search while it's small. For a traceability
+  corpus the decisive driver is the **join + coherence**, not scale.
+  - *Store choice under traceability — single-system ACID beats a faster dedicated store when
+    coherence is correctness, not just performance.* A dedicated vector DB (Qdrant/Weaviate) has
+    superior pre-filtering, but it keeps vectors in one system and citation metadata in another, and
+    **their coherence becomes your job**. For a corpus whose value *is* the vector↔citation binding, a
+    drift between the two is a phantom citation by the back door — so the single-system atomic query
+    (below) is worth more here than the dedicated store's speed. Generic guidance ranks the dedicated
+    store higher because it optimizes throughput, not coherence-as-correctness — a different objective.
+    *(This is why the store is Postgres+pgvector — vectors and citation metadata in one ACID system —
+    rather than a dedicated vector DB beside a relational one.)*
+- **Filter inside the top-k, in one atomic statement — not after it.** The typed filters (authority,
+  document, chunk type) go in the `WHERE` of the *same* statement as the `ORDER BY <distance> LIMIT k`
+  and the join to the document table. Filtering *after* a top-k is a measured failure mode: ask for 5,
+  get 1, because the other 4 were filtered out post-hoc — and it gets **silently worse the more
+  selective the filter**. This single atomic statement *is* the property that justified the
+  single-system store; a vectors-here-metadata-there split cannot do it without coordinating two
+  systems. *(In the exact regime the filter just narrows the rows the scan sees; the "a selective
+  filter starves an ANN index of candidates" problem — and its `iterative_scan` remedy — is an ANN
+  concern that doesn't arise until you add an index.)*
+- **The retrieval result carries cite-text, never embed-text** *(instance of the Phase-2 frontier at
+  the API boundary)*. The result exposes the verbatim citable text and the citation coordinates; the
+  embedded contextual header stays out — and the discipline is to **not even `SELECT` the embed-text
+  column**, so no downstream consumer can echo the synthetic header as source. Convention keeps it out
+  of the contract; not selecting it keeps it out by construction.
+- **Choose the distance operator to match the eventual index's metric — even before the index
+  exists.** With no index the operator choice has no measurable effect (every operator is the same
+  scan), so it costs nothing to fix now; but an ANN index built for one metric **silently falls back
+  to a full scan** for a query written with a different operator — no error, a 100–1000× latency
+  regression that surfaces months later in a system that "has an index." Pick the metric once (cosine,
+  for text embeddings — and for **robustness**, since cosine doesn't depend on the vectors staying
+  normalized where inner-product would), and write every query with its operator from day one.
+- **Embed the query through the same seam that embedded the corpus, and guard the dimension at the
+  source.** Same model/dims → same space *by construction*, not by discipline. Still assert the query
+  vector's dimension before searching: a changed embedding model would put query and corpus in
+  different spaces and the distances become **noise with the shape of a result** — five ranked,
+  plausible, unrelated hits, with no downstream signal that anything is wrong. Guard where the fault
+  is produced, not where it would (never) be noticed.
+
+### Decision points
+
+- **Exact (sequential scan) vs. approximate (ANN) index — the marquee retrieval decision.**
+  - *Maturity:* **exact is the MVP** and the correct *starting* state, not a placeholder; ANN is a
+    scaling node.
+  - *Applicability condition (static):* a **total-recall requirement** (traceability: a neighbor
+    dropped by approximation can be a requirement dropped) makes exact the default *while it's
+    feasible*. Generic RAG treats 98% recall as ≈100%; a normative corpus does not. Exact is also the
+    **ground-truth oracle** any future index is measured against, so you build it regardless.
+  - *Trigger signal (dynamic):* the **measured p99 of the database read** crosses the interactive SLO
+    (~100–200 ms) — read it off the DB time, **not** the end-to-end. (Measured here: 65/69 ms p50/p99
+    in the DB at ~14k vectors, well under SLO; the ~200 ms of end-to-end on top is the query's
+    embedding network call, which no index touches — reading the trigger off the e2e number would add
+    a vector index to fix a *network* latency. Linear projection to a full ~60–100k corpus nears
+    350–450 ms and would cross it — but a projection is not a measurement, and the rule is *measure*.)
+  - *When you do leave exact, go to HNSW, not IVFFlat, for a **growing** corpus:* IVFFlat needs
+    training and **degrades recall silently as inserts drift from the k-means partition it was built
+    on** — exactly the silent recall-loss a traceability corpus can't tolerate; HNSW absorbs inserts
+    incrementally. (Build-time `m`/`ef_construction` are informed 1536-dim community defaults, not a
+    project decision; query-time `ef_search` is the one you'd tune — and only *after* hybrid and
+    reranking exist, since they change the vector channel's recall budget.)
+  - *What exact also buys, beyond recall:* it removes three families of operational complexity the ANN
+    path carries — index memory sizing, index build parameters, index maintenance (reindex/vacuum) —
+    each returning *deliberately* when scale forces the index, not before. And in the exact regime
+    `EXPLAIN` showing a **`Seq Scan` is correct** — the acceptance criterion is inverted vs. the
+    generic "you must see an index scan."
+
+- **Distance is a ranking device, not a calibrated confidence score.** Measured twice: the
+  out-of-domain archetype and the generic-in-domain archetype **overlap** in distance (no threshold
+  separates "the corpus doesn't have this" from "it has it, generically"); the *worst*-behaving
+  semantic archetype (the identifier trap) had the **lowest** distances of all; and hybrid improved
+  that archetype while its **mean distance got worse**. Two consequences. (1) An "I don't know" gate
+  **cannot** be a distance threshold — it lives in the generator's grounding/refusal instruction
+  (Phase 5), not in a retrieval cutoff. (2) Fuse channels by **rank, not by score** (RRF, below):
+  building fusion on the distance scale would rest on a number these measurements show doesn't support
+  that reading. *(Reinforces the Phase-2 restraint: don't convert distance into a `1 − d` "similarity"
+  and threshold on it.)*
+
+- **Recall-in-k, ranking, and answer-quality are three different failures — measure which one you
+  have.** A correct chunk can be *absent from* the top-k (recall), *present but mis-ranked* (ranking),
+  or *present and well-ranked but not actually answering* (quality). They need different fixes, and a
+  single query set can exhibit more than one: the identifier trap was **both** — for one clause the
+  discriminating chunk was in the top-5 but out-ranked by chunks that merely enumerate the terms
+  (ranking); for another, the discriminating table sat at rank 6, **outside** the top-5 (recall). Don't
+  accept "the vector fails" as a diagnosis — name which failure, because the cheap diagnostic (exact
+  regime, recall 1.0 verified against the brute-force oracle) is precisely what lets you tell them
+  apart. *And a downstream caveat that resizes the problem:* if generation receives the top-k, a chunk
+  mis-ranked but still **inside** k is available to the generator, so the ranking failure may be
+  **absorbed** downstream — measure whether the mis-rank is load-bearing for the *generated answer*
+  before investing in fixing retrieval ranking for its own sake.
+
+- **Dense-only vs. hybrid retrieval — the Phase-2.7 forward pointer, built and measured here.** The
+  index-time probe predicted this (trap pair dense-similar at 0.98); the retrieval phase confirmed the
+  failure query-side and built the fix.
+  - *Mechanism:* two channels — exact cosine (dense) and lexical `ts_rank` over a full-text index —
+    each carrying the **same filters**, fused by **Reciprocal Rank Fusion**. RRF is rank-based: no
+    score normalization between two incomparable scales, and (per the node above) it avoids building on
+    the uncalibrated distance scale. Two statements + fusion in application code, not one
+    full-outer-join SQL — the fusion becomes pure, unit-testable logic without giving up filtering in
+    SQL. The lexical index is built over **cite-text, not embed-text** (embed≠cite, third instance:
+    indexing the header would fabricate lexical matches from the section path).
+  - *Measured result — a surprise that refuted the pre-registered hypothesis.* Hybrid recovered and
+    re-ranked the identifier trap where dense alone failed. The predicted reason it *wouldn't* work
+    (the distractors share the same tokens `b`/`c`/`criticality`) was wrong: the discriminating content
+    lived in **tables**, which repeat those tokens far more than the short definitional distractors,
+    and `ts_rank` weights by term frequency. So **lexical repetition density turned out to be a usable
+    proxy for "this fragment breaks the topic down by category"** — a structural property the dense
+    model missed that had a lexical correlate after all. *(General node: a lexical channel can't tell
+    "explains the difference" from "mentions the terms," but it can tell density — and in a tabular
+    corpus density proxies for breakdown.)*
+  - *The other half of the measurement — hybrid also **hurts**, and that defines the next knob.* On a
+    generic query ("verification requirements") the lexical channel matched thousands of chunks, ordered
+    them by density (which doesn't track relevance there), and — because **unweighted RRF gives the
+    lexical channel an equal vote always** — degraded the result (kept 1 of the vector's top 5). So the
+    graduated result is: *unweighted hybrid is a floor, not the answer.* It helps where the vector is
+    blind (identifiers, tables) and hurts where the vector was right (generic intent); the real lever is
+    **fusion weighting**, deferred to the tuning phase — with the reranker's role now *open* rather than
+    assumed, since lexical alone already fixed the trap a reranker was expected to be needed for.
+  - *Two failure modes worth keeping.* **OR, not AND, for the lexical query:** `plainto`/`websearch`
+    tsquery ANDs terms by default, so a multi-term natural question matches ~nothing, the lexical
+    channel returns zero rows, RRF degenerates to the pure vector ranking, and **hybrid silently behaves
+    exactly like vector while appearing to run** — a smoke test would pass. (Also discard `and`/`or`/
+    `not` appearing *inside* the user's phrase; there they are search words, not operators.) **And a
+    second retrieval channel audits the first:** the lexical channel could not index 103 chunks whose
+    citable text is a withdrawn-clause marker (`-`, `<<deleted>>`) — chunks the vector channel silently
+    *can* return; adding the channel surfaced garbage the first held without complaint. *(An instance of
+    "audit what appears to work," Cross-cutting.)*
 
 ---
 

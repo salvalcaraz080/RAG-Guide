@@ -311,6 +311,24 @@ different stage.
   don't document it. *(All-or-nothing belongs here too: a derived artifact consumed as complete is
   replaced only if every declared item produced output — 25 of 26 isn't "almost right," it's a
   smaller corpus occupying a complete one's slot, a silent failure the log dresses up.)*
+  - *Corollary — one accessor, or "iterate the declared" (the root node) re-decays into N directory
+    scans.* The root node holds by construction only if every consumer reads the declared set through
+    **one accessor**; left to each module it re-grows as separate `glob(processed/*.json)` calls with
+    divergent ad-hoc exclusion lists — observed as six modules drifting apart, one crashing on a
+    derived artifact it mistook for a source document and a coverage report reading **107%**. That one
+    accessor also owns **canonical order**: a fingerprint over a *set* must digest it sorted (as
+    `corpus_version` already does), or a semantically-null reorder of the hand-edited manifest changes
+    the digest and forces a needless re-embed — make order the accessor's property and every downstream
+    fingerprint inherits it, instead of each digest site having to remember to sort (one didn't, and
+    passed only because the manifest's declaration order *happened* to match sorted). And "sorted" is
+    not yet enough: the accessor sorts by *key*, so a digest that sorts by filename (`{key}.json`) is a
+    *different* canonicalization, and the two diverge exactly when one key is a prefix of another —
+    inert until a corpus has that shape, then a content-neutral addition moves the fingerprint. The
+    invariant is *one ordering function* used at the accessor and every digest site, not merely "both
+    sorted." The single scan
+    that stays legitimate is the **inverse** question — "what is present that the manifest does *not*
+    declare?" — which cannot come from the manifest; give it one central registry of derived artifacts,
+    never the per-module blacklists that were the bug.
 
 - **A latent defect masked by an accidental precondition activates when the precondition changes.**
   Numbering errors in handbook sections were harmless *only because* another decision (citations hang
@@ -736,7 +754,20 @@ index is exact (sequential scan), not approximate** — see the marquee decision
     second retrieval channel audits the first:** the lexical channel could not index 103 chunks whose
     citable text is a withdrawn-clause marker (`-`, `<<deleted>>`) — chunks the vector channel silently
     *can* return; adding the channel surfaced garbage the first held without complaint. *(An instance of
-    "audit what appears to work," Cross-cutting.)*
+    "audit what appears to work," Cross-cutting.)* *And a sequel the day those chunks are actually
+    filtered out: 103 was the count of the **wrong instrument**. It measured lexical blindness
+    (`cite_tsv` empty); the criterion a filter enforces is "the verbatim **is** a withdrawn-clause
+    marker," which catches **121**. The 18-chunk gap is not slop — those markers carry lexemes
+    (`<<deleted, covered by 5.4.1.2>>`), so the lexical channel **can** retrieve them: the more
+    dangerous ones the lexical-blindness count hid. The number you turn into a filter must come from
+    the instrument that matches the filter's criterion, not a proxy for it (Cross-cutting: "diagnose
+    before you repair").* *And a further sequel once the filter was built: even 121 was
+    proxy-complete — the drop predicate missed 5 more markers (a space after `<<`, a `>>deleted>>`
+    typo). The completeness guarantee is a separate **independent oracle** over the survivors, broader
+    than the drop predicate — provable by construction (predicate off → it flags all 181 markers; on →
+    zero survive) — never a count derived from the filter. Calibrating it is its own lesson: key on a
+    **distinctive marker word** (deleted, moved, withdrawn), never on mere absence of content, or real
+    terse clauses (`See 5.3.5.2`, `A-A-`) trip it.*
 
 ---
 
@@ -1114,6 +1145,16 @@ on the provider seam (Phase 1) and the output contract (Phase 2).
     store (Redis/PG), TTL, and federation to a deployment phase. It composes with the fail-policy
     test above: session state is **not degradable** (its absence changes the answer) → a
     provided-but-absent `session_id` is a **loud error**, never a silently-single-turn answer.
+    *And enforce the condition, don't merely write it:* a startup guard that refuses
+    `WEB_CONCURRENCY > 1` while sessions are in-memory turns the comment into a **config-relation
+    fail-fast guard** (the shape of the eval-mode guard below). What makes it worth building is that its
+    trigger is anchored to the **mechanism**: `WEB_CONCURRENCY` is the variable the server itself reads
+    to spawn workers, so declaring N both starts N workers *and* trips the guard — it catches the
+    standard deployment path, not just the operator who happens to be honest. *A guard's reach is
+    proportional to how tightly its trigger couples to the real failure mechanism*; the gap that stays
+    uncoupled (a CLI `--workers N` never passes through settings, because a worker can't count its
+    siblings) goes in the guard's own error message, or the operator switches off what they can't see
+    the point of.
   - *Window strategy — simple sliding window over cumulative summary, and **why** for a traceability
     corpus.* A plain last-N-turns window is defensible while (a) the source of truth is the corpus,
     not the history, and (b) anaphora is short-range (it points at the prior turn; conversations
@@ -1392,7 +1433,14 @@ way — mostly in the data layer, but they generalize.
   characterizes the problem before you touch it. It isn't ceremony: a conversion diagnostic surfaced a
   silent-success tool bug; a numbering diagnostic showed the problem was 500 clauses, not 4; a table
   diagnostic showed "merged" was three problems. Writing the repair without the diagnostic
-  mis-sizes it. The diagnostic's output *is* the repair's specification.
+  mis-sizes it. The diagnostic's output *is* the repair's specification — but only when it measured the
+  property the repair will **enforce**, not a proxy for it. A count taken with a mismatched instrument
+  becomes a confident, wrong spec: a "lexically-blind chunks" count (103) stood in for a "verbatim is a
+  withdrawn-clause marker" criterion (121), and the 18 it missed were the *retrievable* — the dangerous
+  — ones (Phase 3.5). Before a diagnostic number becomes an enforced gate, check that its instrument
+  and the gate's criterion are the same question. And for a membership predicate, no count can carry
+  the guarantee at all: a count is blind to what the predicate *under*-matches, because it is taken
+  with that same predicate — verify the complement with an independent, broader oracle instead.
 
 - **Measure and repair are different tasks — keep them separate.** Audit apart from fix, diagnosis
   apart from extraction. A brief that "audits **and** fixes what it finds" is open-scope; the
@@ -1434,7 +1482,9 @@ way — mostly in the data layer, but they generalize.
   *Where a reliable structural order exists, key on position, not on content* — a content-derived key
   in a repetitive corpus fabricates matches, and in the direction that most alarms (reporting
   re-anchoring that didn't happen). *And compare against the canonical structure by component, not by
-  surface.*
+  surface.* *And match on the whole value, never a substring of it* — a marker predicate keyed on the
+  token "moved" swallowed the real clause "…shall be removed…"; substring containment fabricates the
+  same false positives as the prefix test above.
 
 - **Verification has its own failure modes — a green check can be a check that never ran.**
   *Resolving a discrepancy is not passing the test:* explaining why an anomaly *looks* wrong (a copy
@@ -1447,6 +1497,9 @@ way — mostly in the data layer, but they generalize.
   test and fails only on first real run (and silently, if the wrong value happens to match). *A small
   count still demands inspection — rare is not nonexistent:* "5 of 1455, negligible" and "0, the regex
   false-matched all 5" are the same decision reached for opposite reasons, and only one leaves a true
-  belief behind.
+  belief behind. *And a concurrency test must count the work done* while *the call is in flight, not in
+  total:* a heartbeat tallied after the awaited call returns reaches the same total whether the loop
+  stayed free or starved — it just arrives later; count the ticks that occur *during* the outstanding
+  call (19 free vs 0 starved), or the green proves nothing.
 
 ---

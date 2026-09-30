@@ -306,7 +306,10 @@ different stage.
   (so "sections" means "citable clauses," no filter to remember downstream); a table with **no
   identifier of its own** (impossible to cite as if it were a clause); a generated report that
   **overwrites itself** on regeneration (editing it isn't "discouraged," it's undone); verification
-  by **conservation** (tables-per-mechanism sums to total tables → silent discard is impossible).
+  by **conservation** — but conserved *against the source*, not against your own output: a sum of
+  tables-per-mechanism checked against the parser's own table list can never fail (it was shipped
+  that way and was green for sessions); it only rules out silent discard when the total comes from the
+  raw document (its non-nested `w:tbl`), which the parser cannot shape.
   *A precondition someone will skip isn't a precondition, it's a bug with good manners* — enforce it,
   don't document it. *(All-or-nothing belongs here too: a derived artifact consumed as complete is
   replaced only if every declared item produced output — 25 of 26 isn't "almost right," it's a
@@ -844,6 +847,17 @@ on the provider seam (Phase 1) and the output contract (Phase 2).
   claim with no anchor. Detect it and mark the response unreliable; do **not** try to prevent it by
   instructing the model to be brief (that competes with completeness — it may drop applicable
   requirements to fit a word budget). Generous `max_tokens` + detection, not prevention by prompt.
+  *And detection is only as honest as the field's **default**.* A wrapper that initializes
+  `finish_reason = "stop"` asserts "the model finished normally" before anyone checked; when the
+  provider closes a stream with **zero deltas**, the loop never overwrites it and an empty answer
+  ships as a success — with its evidence attached behind a text that doesn't exist. A state field
+  defaults to **"unknown"**, never to the good case, and a measurement nobody took is **`None`**,
+  never a number (`distance = 0.0` reads as "identical to the query"). The empty answer itself is
+  then *named*, not delivered: an error event on the stream, a 502 on the request (well-formed
+  request, unusable upstream reply), and no assistant turn written to the session (an empty turn
+  would be re-injected into the next question). *Residual:* a boolean derived from that field
+  (`truncated = finish_reason == "length"`) inherits the problem — under "unknown" it says "not
+  truncated" when the truth is "don't know"; it wants to be three-state.
 - **Structured logging is unconditional; the decision is *what fields*, not *whether*.** Use a
   structured logger (e.g. structlog) with dual rendering (human console in dev, JSON in prod) and a
   per-request `request_id` bound via middleware so one query's full trace (HTTP → cache → LLM →
@@ -1223,8 +1237,20 @@ demonstrable*, it is not a second backend.
   so the diagnostic path and the real path share one source; fidelity is then guaranteed **by
   construction**, not by remembering to keep two copies in sync. Match exposure to naturalness:
   instructions are static (a global `GET` is stable across CAG→RAG); context is per-request in RAG,
-  so it rides the query response (opt-in behind a flag — it's *content*, not metadata, and can be
-  large), never a global endpoint that RAG would invalidate.
+  so it rides the query response, never a global endpoint that RAG would invalidate.
+  - *Revised once it became evidence — the trace is part of the contract, not an opt-in.* The first
+    version gated the context behind a request flag, as a string blob. Once the context *is* the
+    retrieved evidence, it travels **always**, typed (a list of evidence atoms), in the response and
+    in the stream's terminal event. **An API contract does not depend on a flag or on the
+    environment**: a contract that forks by `APP_ENV` makes the tests evidence about a shape that
+    isn't the deployed one. Hiding diagnostic noise is the **render's** job, governed by the
+    *frontend's* own env variable and compared so that a typo **hides** rather than leaks. And the
+    atom is **one shared model**: the search endpoint's hit *extends* it with retrieval-only
+    diagnostics (per-channel ranks) instead of a twin DTO with the same fields — two twins are two
+    places that drift. Keep *evidence* and *citations* semantically separate: a refusal empties the
+    citations (no phantom citation) but the evidence still travels, because what was retrieved is a
+    fact of the system independent of what the model did with it — "the retriever brought these
+    five and the model still said *not covered*" is the primary signal for diagnosing retrieval.
 
 #### Decision points
 
@@ -1500,6 +1526,11 @@ way — mostly in the data layer, but they generalize.
   belief behind. *And a concurrency test must count the work done* while *the call is in flight, not in
   total:* a heartbeat tallied after the awaited call returns reaches the same total whether the loop
   stayed free or starved — it just arrives later; count the ticks that occur *during* the outstanding
-  call (19 free vs 0 starved), or the green proves nothing.
+  call (19 free vs 0 starved), or the green proves nothing. *The general form of several of these: an
+  instrument measured with, or against, the thing it verifies cannot detect that thing's omission.* A
+  count gate taken with the drop predicate is blind to what the predicate misses ("Diagnose before
+  you repair"); a table-conservation check summing the parser's output against the parser's own list
+  can't fail (Phase 2.5). Before trusting a green, ask where its reference total comes from — if the
+  answer is "the same code under test," it is a check that cannot run red.
 
 ---

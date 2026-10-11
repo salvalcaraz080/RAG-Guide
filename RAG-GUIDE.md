@@ -160,7 +160,9 @@ fields, and above all how it carries its sources.
   material you fed the model (a v0 schema concern). *Verifying* = proving the answer actually used
   what it cites and didn't hallucinate a reference (a later generation-quality concern). The
   schema field's mere presence does not mean verification is done — mark this explicitly so a
-  later phase doesn't assume it's solved.
+  later phase doesn't assume it's solved. *Once retrieval is wired, verification splits into three
+  levels* — membership, literalness, support — and only the first two are deterministic (Phase 3.5,
+  *Wiring retrieval into generation*).
 
 ### Decision points
 
@@ -620,9 +622,9 @@ pipeline to debug in parallel.
 The CAG→RAG substitution the seam (Phase 1) was built for: the `context` slot stops being a static
 slice and becomes the top-k of a semantic search over the Phase-2.7 index. Build it as a
 **standalone, measurable retrieval layer first** — a `/search` that embeds a query and returns cited
-chunks — and wire it into generation only afterwards (that wiring is the generation phase; a
-standalone retriever keeps the data objective from tangling with the generation one). The **starting
-index is exact (sequential scan), not approximate** — see the marquee decision below.
+chunks — and wire it into generation only afterwards (a standalone retriever keeps the data objective
+from tangling with the generation one; the wiring has its own section below). The **starting index is
+exact (sequential scan), not approximate** — see the marquee decision below.
 
 ### Patterns & practices
 
@@ -771,6 +773,138 @@ index is exact (sequential scan), not approximate** — see the marquee decision
     zero survive) — never a count derived from the filter. Calibrating it is its own lesson: key on a
     **distinctive marker word** (deleted, moved, withdrawn), never on mere absence of content, or real
     terse clauses (`See 5.3.5.2`, `A-A-`) trip it.*
+
+### Wiring retrieval into generation
+
+The step where the retriever replaces the static context. It looks like one line (`get_context` now
+calls the retriever) and is in fact five decisions: where the call enters, what the unit of context
+is, how the model cites, how a conversation reaches the retriever, and what you can verify about the
+answer. Most of what was learned here was learned by **correcting** first choices against a UAT, so
+the failure modes are named.
+
+#### Patterns & practices
+
+- **Inject a context provider into the preparation point — don't retrieve in the router.** The
+  generation service receives a provider (a callable: query → evidence) and calls it **where the
+  static context used to be read**, after input guardrails and session resolution. Retrieving in the
+  router "to keep the LLM service ignorant of the database" looks cleaner and breaks the invariant
+  *guardrails before any effect* (Phase 4): embedding a query and reading the database are effects, so
+  a toxic question would trigger retrieval. The provider gives you both properties: the LLM service
+  imports nothing from the data layer (enforce it with an import test **in a subprocess** — in the
+  suite's process everything is already imported), and the order stays intact. The provider opens its
+  own **short** database session per call rather than borrowing a request-scoped one whose lifetime
+  against a streaming response is fragile. Return a small typed result (evidence + mode + per-stage
+  latencies), not a bare list, so one retrieval log event can be emitted by whoever knows the grouping.
+- **No context → fail closed, and verify the seam against the real stack.** A RAG answer without
+  retrieval is an ungrounded answer, so an unreachable embedding service *or database* is a 503 /
+  typed stream error, never a fallback to "answer anyway" (contrast moderation, which can fail open).
+  The mocked test raises the exception you expected; the real driver raised another (`socket.gaierror`
+  is an `OSError`, not a `SQLAlchemyError`) — uncaught, it is a 500 and a broken stream. Stop the
+  database once and watch.
+- **The unit of context is the citable unit, not the chunk.** Group retrieved chunks by their
+  citation coordinate (document + clause) and order groups by their best rank. Five chunks of one
+  clause take **one** slot, which removes the "clone results" failure without MMR and yields the
+  citation granularity the product promises. Keep each chunk's authority grade inside the group — a
+  clause can mix normative and informative items, and grouping must not erase that.
+- **Recomposition: measure before you expand.** Grouping only what was retrieved leaves most groups
+  partial (measured: 70% of retrieved clauses incomplete). Expanding every hit to its whole parent
+  unit multiplies the context (median ×4, tail ×5 — long annexes of tens of requirements). The
+  candidate is **bounded** expansion, prioritized by the cheapest high-value case: an orphan fragment
+  that is meaningless alone (a one-line note that only says "refer also to clause X") pulled in
+  without the requirement it qualifies.
+- **Context block: tagged sources with opaque per-request handles.** Each group is a `<source id="n">`
+  with its citation coordinates as attributes and its items' verbatim cite-text inside. The model cites
+  `[n]`; the server maps `n` back to the coordinate. **Opaque handles over natural IDs when the model
+  knows the corpus from pre-training:** with natural IDs it can cite a real clause it was never given;
+  with handles, citing what wasn't retrieved is impossible by construction. Escape the **attributes**,
+  not the text — the text is what the model must be able to quote verbatim, and an escaped entity
+  would end up inside the quote and fail validation for a reason that isn't the model's. Don't expose
+  distance or ranks: the model can't use an uncalibrated number and order already carries rank.
+- **Citations = what the model marks, not what was injected.** Extract `[n]` from the final text
+  (`[1, 3]`, `[1][3]`), keep valid ones, dedupe in order of appearance. Out-of-range handles produce no
+  citation and are logged. This is the **fan-out** fix (measured: 1 of 7 injected clauses cited), and
+  it changes what "citations" and "evidence" mean: they now differ, so the UI has to show *cited* and
+  *retrieved-but-not-cited* separately. *It also retires the "cut citations on refusal" bridge*
+  (Phase 5): phantom citations came from attaching injected material; with marker-derived citations
+  they can't occur, and the old rule only produced `[3]` in the text with no source underneath.
+- **Verbatim quotes give a deterministic support check — on a normative corpus.** Ask the model to
+  quote the **minimal** literal span of a requirement next to its marker (`"…" [n]`); paraphrase
+  inside a norm alters it anyway. Validate by substring against the cited group after normalizing
+  **both** sides identically (Unicode NFKC, collapsed whitespace, re-joined line-break hyphens,
+  unified quotes, stripped trailing punctuation). Run it in **observation mode** first — log, don't
+  reject — and decide the failure policy with the measured rate. Measured: zero false `not_found`
+  across the UAT, so normalization was sufficient.
+- **In conversational RAG, the history must reach the retriever, not only the generator.** History
+  designed for a CAG generator (resolve "it" against the prior turn) is correct there and broken in
+  RAG: the question is *also* the retriever's query, and "And what does Q-ST-80C say about it?"
+  retrieves nothing. First tool, no LLM: **the retrieval query = current question + the last N user
+  questions**, never assistant answers (long, they drag the vector to a centroid), N≈2 so a chained
+  ellipsis that was itself anaphoric still carries the topic. The provider receives a query string and
+  stays unaware a conversation exists; moderation still sees only the current question.
+- **The stored history is prompt — anything in it is an example the model will copy.** Rewriting
+  `[n]` to natural citations in stored turns (so an old `[1]` can't point at a new source) taught the
+  model a second citation format; it used it instead of `[n]` (1 in 6) and the answer lost all
+  traceability. Store assistant turns **with citation markup stripped**: no stale handle, no format to
+  imitate (6/6 valid markers after). What's lost — which clause backed which past claim — is
+  re-supplied by the next turn's own retrieval.
+- **Claims of absence may only be about what the system checked.** The model sees k chunks, never the
+  corpus. "Not covered by the indexed standards" is false whenever retrieval missed — and it was
+  measured saying a standard "is not indexed" when it was. Phrase it about **the search** ("I could not
+  find this in…"), which is true by construction. Expect the prohibition to be obeyed in the letter
+  only (the model moved to "the indexed standards do not contain…"); the structural fix is a typed
+  output contract, not more prompt.
+- **Reading rules are the CAG inside the RAG.** What belongs fixed in the system prompt of a RAG over a
+  normative corpus is not content but the corpus's *grammar*: obligation keywords ("shall" requirement,
+  "should" recommendation, "may" permission), informative items are not binding, an enumerated list is
+  bounded by the sources found. And write every user-visible phrase in **product voice** — rules that
+  talk about "the provided material" get repeated to the user verbatim.
+- **Log what was retrieved, not how much.** One event per request with each hit's id, rank and
+  distance, the groups after clustering, context-block size, embedding and DB latency separately, and
+  the history depth used; one validation event with valid/invalid markers, cited vs injected groups
+  and verbatim outcomes. Counts tell you something failed; ids tell you which stage.
+
+#### Decision points
+
+- **Precision vs. recall bias — decided by the asymmetry of errors, possibly per query type.**
+  - *Applicability condition:* a compliance-style corpus where **omitting an applicable item** (an
+    enumerative question answered with an incomplete list) is worse than citing an irrelevant one.
+    There: bias retrieval to **recall** (generous k, no aggressive per-chunk filtering) and recover
+    precision in generation (grounding, citation, validation). *Retrieval ensures coverage; generation
+    ensures correctness.* A domain where a wrong number is worse than "I don't know" (estimation)
+    inverts it. Per-query-type tuning needs query routing (a later phase); start with one setting.
+  - *No per-chunk threshold without a calibrated score.* A cosine cutoff applied to fused (RRF) results
+    would drop exactly the lexical identifier hits; and distance doesn't separate "absent" from
+    "generic" (above). Per-chunk filtering waits for a score that measures the query–chunk pair
+    (reranker); the abstention decision stays in the generator.
+
+- **Conversational retrieval — concatenation vs. LLM condensation.**
+  - *Applicability condition:* a conversational product. Then the history has to reach retrieval
+    (above); the fork is *how*.
+  - *Maturity:* **concatenate prior user questions** first — zero calls, zero new prompt, no new
+    failure mode. Its cost is topic contamination when the user switches subject mid-conversation,
+    cheap under a recall bias.
+  - *Trigger signal:* contamination **observed in real use** (retrieved sources from the previous
+    topic after a self-contained new question) → condense the follow-up into a standalone question with
+    a small model. The rewrite only feeds retrieval, never enters the prompt as source, so it doesn't
+    cross the citable frontier. *Measured:* none observed with users who chain questions on one topic.
+
+- **Citation validation — three levels, only two of them deterministic.**
+  - **Membership** (`[n]` exists in this request) and **literalness** (the quote is in the cited
+    source) are cheap and deterministic. **Support** (the source says what the sentence claims) is not:
+    measured on a table of near-identical rows ("category: X. Definition: …"), **1–2 answers in 6**
+    attributed a row to the wrong category with a quote that was **literal and correctly referenced**.
+    Passing the first two levels does not imply the third. The policy on unsupported citations needs a
+    faithfulness evaluation, not a substring.
+
+- **Securing the data layer of a RAG — authorization in retrieval, not keys on endpoints.**
+  - *Applicability condition:* a corpus with **per-user permissions or multiple tenants**. Then the
+    filter goes **inside** the retrieval query — post-filtering the answer is too late, the model
+    already read the text. API keys protect the endpoint, not the data.
+  - *Maturity:* rate limiting earns its place with **public exposure or multiple consumers**; before
+    that, a spend cap at the provider covers the cost risk with zero code (and also catches your own
+    runaway loops). Authentication follows the consumer: service-to-service → API key
+    (constant-time compare), end user → session/JWT. *(Decided here, not built: public corpus, no
+    public URL.)*
 
 ---
 
@@ -1181,6 +1315,10 @@ on the provider seam (Phase 1) and the output contract (Phase 2).
     the product demands **long-range multi-turn synthesis** (a wedge decision — a Q&A product asks
     short-chained questions; an analysis copilot weaves), and even then prefer **anchors of whole
     turns** (hybrid-with-anchors where the anchor is the intact turn) over a generated summary.
+  - *Once retrieval is wired, history has two more jobs:* it must reach the **retriever** (the
+    question is also the search query), and the **stored** assistant turns must carry no citation
+    markup, because stored history is an example the model imitates (Phase 3.5, *Wiring retrieval
+    into generation*).
   - *Implementation notes (agnostic, minor):* mutate the history collection **in place**
     (`history[:] = history[-2N:]`) rather than reassigning the attribute, to avoid re-validating the
     whole Pydantic model on the hot path; and beware a constant that encodes an **implicit
@@ -1247,10 +1385,11 @@ demonstrable*, it is not a second backend.
     *frontend's* own env variable and compared so that a typo **hides** rather than leaks. And the
     atom is **one shared model**: the search endpoint's hit *extends* it with retrieval-only
     diagnostics (per-channel ranks) instead of a twin DTO with the same fields — two twins are two
-    places that drift. Keep *evidence* and *citations* semantically separate: a refusal empties the
-    citations (no phantom citation) but the evidence still travels, because what was retrieved is a
-    fact of the system independent of what the model did with it — "the retriever brought these
-    five and the model still said *not covered*" is the primary signal for diagnosing retrieval.
+    places that drift. Keep *evidence* and *citations* semantically separate: citations are what the
+    model **marked** (Phase 3.5), evidence is what was **retrieved**, and the evidence travels on every
+    answer including a refusal, because what was retrieved is a fact of the system independent of what
+    the model did with it — "the retriever brought these five and the model still couldn't find it" is
+    the primary signal for diagnosing retrieval.
 
 #### Decision points
 
@@ -1360,21 +1499,27 @@ read the maturity field, don't adopt the whole pipeline at once.
     the one that prevents a phantom citation when the corpus doesn't hold the answer. Both are the
     *filter* policy; instructed in the prompt, not a Python validator (real grounding verification is
     a later phase).
-  - *Bridge pattern until structured output — a natural marker phrase.* To act on a refusal (e.g.
-    suppress the candidate citation on it) before you have a typed refusal field, have the model
-    **begin the refusal with a fixed natural phrase** (`"Out of scope:"` / `"Not covered by the
-    provided material:"`) and detect it by prefix at the shared assembly point. Choose a *natural
+  - *Bridge pattern until structured output — a natural marker phrase.* To act on a refusal (type it
+    in the response, log it) before you have a typed refusal field, have the model **begin the refusal
+    with a fixed natural phrase** (`"Out of scope:"` / `"I could not find this in the indexed …:"`) and
+    detect it by prefix at the shared assembly point. The phrase reaches the user verbatim, so it must
+    be in **product voice** and **true by construction**: about the search, never about the corpus
+    (Phase 3.5 — an earlier "Not covered by the indexed standards" asserted absences retrieval had
+    merely missed). Choose a *natural
     phrase over a technical marker* deliberately: a technical token (`OUT_OF_MATERIAL:`) would have to
     be stripped from the text, and on a streaming endpoint that means **buffering the stream start** —
     streaming-only logic the "streaming is a deletable delivery layer" rule (Phase 4) forbids. A
     natural phrase *is* the readable message: it streams as-is, detection happens on the assembled
     text, not on bytes already sent to the client. **The streaming principle dictates the guardrail
     mechanism.** It's a bridge — prefix detection is frail if the model doesn't emit the phrase
-    verbatim — that retires when structured output gives a typed refusal field. *(A related domain
-    trap: a candidate citation derived from the injected material and attached unconditionally becomes
-    a phantom citation on every refusal — and on a single-fragment CAG slice, refusals are the common
-    case, so the better the scope guardrail works, the more phantom citations it produces. Cut the
-    citation on detected refusal.)*
+    verbatim — that retires when structured output gives a typed refusal field. *Measured limit:*
+    a binary prefix can't express a **partial** answer, and prompting for "answer what you found, name
+    the gap at the end" failed with a small model (two rewrites; it still opened with the refusal
+    phrase when the named standard wasn't retrieved). The fix is a typed coverage field in the output
+    contract, not more prompt. *(Historical bridge, now retired: while citations were derived from the
+    injected material, a candidate citation attached unconditionally was a phantom citation on every
+    refusal, so citations were cut on detected refusal. Once citations come from the model's markers
+    the phantom can't occur, and the cut only hid real citations — a bridge rule outlived its premise.)*
 
 - **Testing & evaluating a probabilistic component — two sovereign suites, not one with exceptions.**
   - *The reframe:* `assert == expected` doesn't apply to LLM output; you test **properties**, not
@@ -1511,6 +1656,18 @@ way — mostly in the data layer, but they generalize.
   surface.* *And match on the whole value, never a substring of it* — a marker predicate keyed on the
   token "moved" swallowed the real clause "…shall be removed…"; substring containment fabricates the
   same false positives as the prefix test above.
+
+- **Re-examine a bridge rule when the mechanism under it changes.** A protection built for one
+  mechanism becomes the bug of the next: "cut citations on refusal" protected against phantom
+  citations from injected material, and produced unsourced `[n]` once citations came from markers;
+  rewriting stored citations to natural IDs fixed stale handles and created a format the model copied.
+  When you replace a mechanism, list the rules that existed *because of* it and re-justify each.
+
+- **One measured prompt iteration, then change the lever.** With small models an exact-format
+  instruction outweighs a judgment rule, and prohibitions are obeyed in the letter ("not indexed" →
+  "does not contain"). Allow one prompt rewrite with a before/after measurement; if it doesn't move
+  the number, the lever is structural (output contract, retrieval), and further prompt edits are
+  spend without signal.
 
 - **Verification has its own failure modes — a green check can be a check that never ran.**
   *Resolving a discrepancy is not passing the test:* explaining why an anomaly *looks* wrong (a copy

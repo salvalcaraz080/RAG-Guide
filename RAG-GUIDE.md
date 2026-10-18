@@ -347,7 +347,8 @@ different stage.
 ### Validating a data-derived extractor — measure before you build on it
 
 - **Precision and recall are not equally grave; the domain sets the weight.** For a reference
-  extractor feeding a graph/metadata layer: a false positive is noise a reranker can filter; a false
+  extractor feeding a graph/metadata layer: a false positive is noise a later stage can catch (don't
+  assume a reranker will — Phase 3.5 measured one that couldn't separate hard negatives); a false
   negative is *a connection the system doesn't know exists*. In a traceability system the **omission
   (recall) is the expensive failure**, so recall governs the decision to build on the extractor at
   all — a graph over 48%-recall references is debt shaped like a feature. Measure it; don't assume it.
@@ -483,8 +484,16 @@ only when the slice stops being enough.
     corpus condition was known at index time, the dense index design left room for the lexical channel,
     so adding it was a slot-fill, not a redesign. *What the probe could not predict, and Phase 3.5
     measured:* the fix works via lexical **repetition density** (not the shared identifier tokens), and
-    it **helps identifiers/tables while hurting generic queries** — so the live lever is fusion
-    weighting, not the hybrid on/off choice. See Phase 3.5.
+    it **helps identifiers/tables while hurting generic queries**. The apparent lever — fusion
+    weighting — turned out to be a symptom of a broken lexical channel; and identifiers that name a
+    whole *document* need routing, not hybrid. See Phase 3.5.
+- **Count tokens with the real tokenizer before the window becomes load-bearing.** A ~4 chars/token
+  estimate is fine to start, but measured against a real tokenizer it **over**-estimates prose
+  (~0.82×) and **under**-estimates tables (up to ×2.3). Under it, 287 chunks exceeded a 512-token
+  window — 272 of them tables that were never split — and 204 exceeded even the *estimated* window
+  without being flagged. The cost surfaces downstream (silent truncation in any fixed-window model,
+  e.g. a reranker). Since changing the counter moves every cut and forces re-chunk + re-embed, batch
+  it with the next corpus rebuild rather than patching it alone.
 
 *(Techniques excluded by prior nodes, restated at their point of use: chunking that rewrites the
 source — propositional/LLM decomposition, cluster chunking that loses the source location — is out
@@ -743,14 +752,37 @@ exact (sequential scan), not approximate** — see the marquee decision below.
     model missed that had a lexical correlate after all. *(General node: a lexical channel can't tell
     "explains the difference" from "mentions the terms," but it can tell density — and in a tabular
     corpus density proxies for breakdown.)*
-  - *The other half of the measurement — hybrid also **hurts**, and that defines the next knob.* On a
-    generic query ("verification requirements") the lexical channel matched thousands of chunks, ordered
-    them by density (which doesn't track relevance there), and — because **unweighted RRF gives the
-    lexical channel an equal vote always** — degraded the result (kept 1 of the vector's top 5). So the
-    graduated result is: *unweighted hybrid is a floor, not the answer.* It helps where the vector is
-    blind (identifiers, tables) and hurts where the vector was right (generic intent); the real lever is
-    **fusion weighting**, deferred to the tuning phase — with the reranker's role now *open* rather than
-    assumed, since lexical alone already fixed the trap a reranker was expected to be needed for.
+  - *The other half of the measurement — hybrid also **hurts**.* On a generic query ("verification
+    requirements") the lexical channel matched thousands of chunks, ordered them by density, and —
+    because **unweighted RRF gives the lexical channel an equal vote always** — degraded the result.
+    The tempting conclusion is "tune the fusion weights." **It was wrong, and that's the node:**
+    *"weight the fusion" is usually a symptom, not a cause — fix each channel alone before weighting
+    them.* Measured against a golden set, the degradation had two causes inside the lexical channel,
+    neither in RRF:
+    1. **Asymmetric tokenization.** The application split the query on non-alphanumerics *before*
+       the database saw it, so `ECSS-E-ST-40C` reached Postgres as `ecss | e | st | 40c` — four
+       common tokens (6–10% document frequency each, in OR) — while the indexed documents kept the
+       compound (0.7% df). The discriminating term was never searched. Fix: let the **same parser
+       that built the index** tokenize the query (same text-search config), keep the compound,
+       drop its hyphen parts. *A tokenizer on one side only is a silent asymmetry: every query still
+       returns results.*
+    2. **`ts_rank` has no IDF.** It scores by term frequency and proximity inside each document, with
+       no corpus statistics — so in a corpus whose documents share vocabulary ("requirements",
+       "software"), long chunks that repeat common terms win (the rare discriminating term appeared in
+       1 of the top-10 lexical hits). The "ts_rank vs BM25 difference is noise" claim common in
+       tutorials holds for heterogeneous corpora, **not** for a normative one. Length normalization
+       (`ts_rank(…, 1)`, ÷ 1+log length) or BM25 (a df table computed once per ingestion — no
+       extension needed while the corpus is static) fixed it: generic precision recovered, hybrid
+       went from 0.64 to 0.67–0.69 p@k, **tying** the dense channel (0.68) by trading strata.
+    - *Graduated result:* with each channel working, **unweighted RRF was enough** — a weight tuned
+      on a dozen queries would fit them, not the product. Hybrid's remaining value is per-stratum
+      (named-standard, cross-standard), not global; it stays an option, dense stays default. The
+      earlier "density proxies for breakdown" observation is real but archetype-specific: length
+      normalization trades some of it away for generic precision, and that trade was net positive.
+    - *What IDF does not fix:* **polysemy.** BM25 promoted an exact lexical match on "memory
+      management" from a telemetry-services standard for a flight-software question — right term,
+      wrong topic. Lexical precision has a floor that only semantics or routing raises.
+    - *What hybrid does not fix:* a query that names the **document**. See the routing node below.
   - *Two failure modes worth keeping.* **OR, not AND, for the lexical query:** `plainto`/`websearch`
     tsquery ANDs terms by default, so a multi-term natural question matches ~nothing, the lexical
     channel returns zero rows, RRF degenerates to the pure vector ranking, and **hybrid silently behaves
@@ -773,6 +805,110 @@ exact (sequential scan), not approximate** — see the marquee decision below.
     zero survive) — never a count derived from the filter. Calibrating it is its own lesson: key on a
     **distinctive marker word** (deleted, moved, withdrawn), never on mere absence of content, or real
     terse clauses (`See 5.3.5.2`, `A-A-`) trip it.*
+
+- **Identifier-as-content vs. identifier-as-container — route the second, don't search for it.**
+  - *Mechanism:* a term in the query can name something the text **talks about** ("Stripe" in a
+    budget) or the **document the text belongs to** ("what does ECSS-E-ST-40C require…"). The second
+    kind is invisible to both channels: a document rarely names itself in its own clauses, so dense
+    retrieval returned **0** clauses of the named standard, and hybrid returned **0** of it plus 3
+    clauses *of other documents that cite it*. No fusion weight fixes that — the evidence isn't in the
+    text. It's a **metadata filter**.
+  - *Applicability condition (static):* the corpus is partitioned into units users refer to **by
+    name** (standards, contracts, products, versions) and that name lives in metadata.
+  - *Trigger signal (dynamic):* queries that name a unit get results that **mention** it rather than
+    results **from** it. Check it directly: count, for named-unit queries, how many retrieved items
+    belong to the unit vs. cite it.
+  - *Maturity:* **routing ladder, cheapest rung first.** (0) The caller already knows → put the scope
+    in the API contract. (1) **Deterministic detection** against the canonical identity table (all the
+    forms the corpus uses to name a unit, normalized), returning a *list* (several named → search
+    all). (2) An LLM classifier with a **closed enum** of units — only for what rules can't resolve.
+    Rung 1 was the largest single gain of the retrieval phase: p@k 0.68 → 0.82 overall, named-unit
+    queries 0.41 → 0.74, a follow-up that inherited the unit from history 0.25 → 1.00 — and **faster**
+    (the filter scans fewer rows). Queries that name nothing must take the exact pre-routing path
+    (pin it with a test); log what was detected and the post-filter cardinality.
+  - *Filter vs. quota — measure the cost of the hard filter as its own stratum.* A hard filter cuts
+    cross-references: a question naming one unit whose full answer needs another unit **it refers
+    to** (measured: half the relevant items came from the referenced unit). In that stratum the filter
+    costs precision (0.49 → 0.39) and its candidate recall collapses. A **quota** (most slots from the
+    named unit, the rest open) recovers that stratum but loses more elsewhere (named-unit 0.74 → 0.46);
+    it does not win on balance. The filter stays; the residual is a known, measured gap whose remedy
+    lies in the *references*, not in loosening the filter.
+  - *A related volume effect:* one unit held **35%** of all chunks and flooded the top-k even for a
+    question naming another unit (6 of 9 retrieved clauses). Routing removes it for named queries;
+    for unnamed ones, check the per-unit chunk share before blaming the embedding.
+
+- **Reranker (cross-encoder) — two measurements, not one, decide it.**
+  - *Applicability condition (static):* a latency budget that can absorb a model in the critical path
+    **before the first token**. Read the reranker's cost as a fraction of **TTFT**, not in absolute ms
+    (measured on CPU: +1.5 s for 50 candidates ≈ one extra TTFT; +7 s for 400 ≈ four).
+  - *Trigger signal — both halves required:* (1) **margin in the pool:** relevant items sit deeper
+    than the top-k (measured: candidate recall 0.46 at 50 chunks → 0.70 at 400, at no retrieval-latency
+    cost in the exact regime); **and** (2) **the model converts that margin into precision** — measured,
+    not assumed. Here (1) held and (2) didn't: a small English MS-MARCO cross-encoder tied the dense
+    baseline (0.70–0.71 vs 0.69 p@k) at every pool depth, trading strata. *Margin is necessary, not
+    sufficient.* Rejected for production; reopening means a stronger model, GPU, or a hosted reranker
+    run through the **same harness** (swapping the model is a constant).
+  - *Feed it the context the embedding got.* Fed only the clean cite-text, the reranker was **worse
+    than the vector** (−0.12 to −0.17 p@k), worst on follow-ups; a one-line header (unit · section ·
+    title) recovered it (≈ +0.15). This is the embed≠cite frontier with a **third consumer**: anything
+    that scores relevance (embedding, reranker) should see the context-enriched side; only the
+    generator's quotable source must stay clean.
+  - *Silent truncation:* 8% of (query, chunk) pairs exceeded the model's 512-token window and were
+    scored on a prefix, without error. Count pairs over the window with the model's **real** tokenizer.
+  - *Its score is not a threshold.* The anchor "a pairwise score finally makes per-chunk filtering
+    possible" did not survive measurement: AUC relevant-vs-irrelevant 0.50–0.63 globally and **below
+    0.5 within most queries** against hard negatives. Before fixing any threshold, measure separation
+    within and across queries.
+  - *Patterns if it ever ships:* load once (lifecycle singleton; the healthcheck waits), same type in
+    and out (the stage toggles by config), keep the score in the trace, run inference off the event
+    loop, and keep its heavy dependencies out of the service image until it's decided — an optional
+    dependency group the contract suite runs without.
+
+### Measuring retrieval — build the golden set before the first technique
+
+Every retrieval decision above was taken against the same stick; before it existed, a five-query
+read-by-eye had produced a confident and wrong diagnosis ("tune the fusion"). Build the stick first;
+each later technique becomes a one-line experiment.
+
+- **Small, fixed, stratified, versioned.** A fixed number of real-shaped queries (10–15), stratified
+  by the failure each type exposes (names-a-unit, generic, paraphrase, comparative, cross-unit,
+  multi-turn, names-a-unit-that-refers-to-another). **Report the table by stratum; the mean hides
+  exactly the trade-offs you are deciding** (hybrid tied dense on the mean while swapping strata; the
+  quota won one stratum and lost two). With 1–2 queries per stratum the table is indicative: decide
+  on large, consistent differences only. Grow it by **versioned extension** (old queries and judgments
+  frozen, new ones added where the table had holes), never by silent edits.
+- **The unit of relevance is the citable unit, binary, with a written criterion.** Judge clauses, not
+  chunks (chunk ids die at the next re-chunk; clauses don't), dedupe by clause before computing
+  precision, and write the criterion in one sentence before annotating. A product decision hides in
+  it: "useful informative content counts; authority is metadata, not relevance" — then measure the
+  authority slice (*normative recall*) from metadata instead of annotating it.
+- **Retriever-independent annotation + an incremental mode.** Pooling (annotate only what your
+  configurations return) can't see what all of them miss. Annotate relevants by searching the whole
+  corpus, then judge — by the same protocol — whatever any later configuration brings into its top-k
+  unjudged; a measurement with unjudged items in the top-k is **invalid** until they're judged (else
+  the configuration that finds something new is penalized). The annotator misses things too: every
+  incremental round found relevants the first pass hadn't (7–23%).
+- **An LLM annotator is viable — with three conditions.** (1) **Isolated from the system it judges:**
+  opened inside the repo, a coding agent loads the project instructions, which describe the retriever,
+  its defaults and its known failures — independence is gone before it starts; run it in a workspace
+  holding only the protocol, the document index and the clause export. (2) **Repeatable by protocol,
+  not by model version:** a versioned protocol file (criterion, strata, output schema) + model and
+  date recorded per judgment. (3) **Verbatim evidence checked by code:** every positive judgment
+  carries a literal quote validated against the clause; a non-expert reviewer then only does reading
+  work (does the quote exist and answer?) — the code does the existence check. Run on a subscription
+  rather than an API, it cost nothing marginal.
+- **Two recalls, capped, plus depth.** Precision@k (k = citable units actually delivered) is the robust
+  column. Recall needs a **cap** (hits ÷ min(|relevant|, slots)) or it mixes inability with a
+  structural ceiling; measure it at the delivered k **and** over the candidate pool, and sweep pool
+  depth (50→400) to tell "deeper" from "absent" — that sweep is what decides a reranker.
+- **Measure what reaches the model** — through the production context provider (history composition,
+  grouping, dedupe), not a raw search endpoint — and refuse to run against a corpus whose fingerprint
+  differs from the golden set's. Mark run-to-run instability: query embeddings are not bit-for-bit
+  deterministic.
+- **Cheap mechanism checks before costly techniques.** Four minute-scale checks — what the channel
+  actually returns for a named-unit query, how the query is tokenized on its way to the database,
+  whether the ranking has IDF, how chunks are distributed per document — rewrote the next brief
+  entirely. Looking at the mechanism is cheaper than measuring a solution to the wrong problem.
 
 ### Wiring retrieval into generation
 
@@ -806,12 +942,25 @@ the failure modes are named.
   clause take **one** slot, which removes the "clone results" failure without MMR and yields the
   citation granularity the product promises. Keep each chunk's authority grade inside the group — a
   clause can mix normative and informative items, and grouping must not erase that.
-- **Recomposition: measure before you expand.** Grouping only what was retrieved leaves most groups
-  partial (measured: 70% of retrieved clauses incomplete). Expanding every hit to its whole parent
-  unit multiplies the context (median ×4, tail ×5 — long annexes of tens of requirements). The
-  candidate is **bounded** expansion, prioritized by the cheapest high-value case: an orphan fragment
-  that is meaningless alone (a one-line note that only says "refer also to clause X") pulled in
-  without the requirement it qualifies.
+- **Recomposition: measure before you expand — and with its own metrics.** Grouping only what was
+  retrieved leaves most groups partial (measured: 70% of retrieved clauses incomplete). Expanding
+  every hit to its whole parent unit multiplies the context (median ×4, tail ×5 — long annexes).
+  Expansion is an **augmentation** stage (after the last selection cut, before the context block): it
+  changes *how much* of each delivered unit arrives, never *which* units — so a relevance golden set
+  can't see it. Measure completeness (overall and normative), orphan rate and context tokens.
+  - *Orphans first, free:* add a unit's normative parts only when it was delivered with **none** of
+    them (a note without the requirement it qualifies). Measured: 6 orphans → 0 with 7 chunks across
+    14 requests, context tokens unchanged → default.
+  - *Bounded completion* (normative first, per-unit and per-request token caps): normative
+    completeness 0.59 → 0.95 for **+36% context**; the caps bite on long annexes, as expected. Whether
+    that extra context helps or dilutes the answer is a generation-quality question, not a retrieval
+    one — keep it as an option until generation is evaluated.
+  - *The trace marks what expansion added* (retrieved vs. added): otherwise an audit can't tell what
+    the search found from what was dragged along. Added chunks carry no distance — they were never
+    ranked against the query.
+  - *Completing a unit ≠ following its references.* 4 of 6 orphan notes said "see clause X" — about a
+    **different** clause. Expansion brings the note's own requirement; what the reader wanted was the
+    referenced clause. That is reference traversal, a separate mechanism with its own validation.
 - **Context block: tagged sources with opaque per-request handles.** Each group is a `<source id="n">`
   with its citation coordinates as attributes and its items' verbatim cite-text inside. The model cites
   `[n]`; the server maps `n` back to the coordinate. **Opaque handles over natural IDs when the model
@@ -874,8 +1023,8 @@ the failure modes are named.
     inverts it. Per-query-type tuning needs query routing (a later phase); start with one setting.
   - *No per-chunk threshold without a calibrated score.* A cosine cutoff applied to fused (RRF) results
     would drop exactly the lexical identifier hits; and distance doesn't separate "absent" from
-    "generic" (above). Per-chunk filtering waits for a score that measures the query–chunk pair
-    (reranker); the abstention decision stays in the generator.
+    "generic" (above). A pairwise reranker score was the next candidate and **also failed** to separate
+    (see the reranker node: AUC ≤ 0.63). The abstention decision stays in the generator.
 
 - **Conversational retrieval — concatenation vs. LLM condensation.**
   - *Applicability condition:* a conversational product. Then the history has to reach retrieval
@@ -1612,6 +1761,13 @@ way — mostly in the data layer, but they generalize.
   and the gate's criterion are the same question. And for a membership predicate, no count can carry
   the guarantee at all: a count is blind to what the predicate *under*-matches, because it is taken
   with that same predicate — verify the complement with an independent, broader oracle instead.
+
+- **A proposed fix names a mechanism; verify the mechanism is the cause before tuning it.** "Weight
+  the fusion" was the obvious remedy for a hybrid that hurt generic queries, and it would have been
+  tuned on a dozen queries to fit them. Four cheap checks showed the cause sat one layer down (an
+  asymmetric tokenizer and a ranking without IDF); fixed there, no weight was needed. Same shape as a
+  UAT that can't discriminate: if the expanded unit is never cited, the answer can't change — design
+  the probe so it **depends** on what you're testing, or its "no difference" means nothing.
 
 - **Measure and repair are different tasks — keep them separate.** Audit apart from fix, diagnosis
   apart from extraction. A brief that "audits **and** fixes what it finds" is open-scope; the

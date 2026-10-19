@@ -81,6 +81,17 @@ downstream fork, so write them down.
   - *Practice:* **verify model currency at decision time.** Model lineups and the "cheapest
     current tier" move fast; the obvious default from any written material may already be legacy.
     Confirm the model ID, price, and status before wiring it.
+  - *Re-check currency at every phase change — the model is a first-order lever.* Measured: swapping
+    a small model for its next-generation successor (same tier) moved conditional citation recall
+    0.72 → 0.91, cut cost per answer ~5× and took invalid structured outputs from ~10% to 0 — more
+    than any technique of the same session. Before engineering around a model's limitation (parser
+    tolerance, retries), check whether a newer model removes it, and measure the swap with the same
+    harness and preregistered rule as any other change (Phase 3.5, *Measuring generation*).
+  - *Read the capability table, not the model name.* The abstraction layer may route the same request
+    differently per model (native constrained decoding vs. emulation through a forced tool) — that
+    route, not your code, decides structured-output reliability. Pricing can jump above a prompt-size
+    threshold (Phase 4, *Input-token budget*). Reasoning models spend part of the output-token budget
+    thinking: a 2,000-token cap truncated answers that needed ~3,500.
 
 ---
 
@@ -161,8 +172,8 @@ fields, and above all how it carries its sources.
   what it cites and didn't hallucinate a reference (a later generation-quality concern). The
   schema field's mere presence does not mean verification is done — mark this explicitly so a
   later phase doesn't assume it's solved. *Once retrieval is wired, verification splits into three
-  levels* — membership, literalness, support — and only the first two are deterministic (Phase 3.5,
-  *Wiring retrieval into generation*).
+  levels* — membership, literalness, support — the first two and part of the third (misattribution,
+  modal edits) are deterministic (Phase 3.5, *Wiring retrieval into generation*).
 
 ### Decision points
 
@@ -171,34 +182,38 @@ fields, and above all how it carries its sources.
     support, and by how precise a citation your users need to verify a claim. Don't promise a
     granularity your data can't back.
 
-- **Structured output — force the model to return a typed shape (JSON Schema), or accept free
-  text?** *(the LLM as a typed function, not a text box)*
+- **Structured output — force the model to return a typed shape, or accept free text?**
+  *(implemented — the LLM as a typed function, not a text box)*
   - *Maturity:* the **shape** (a Pydantic/JSON-Schema model) belongs in v0 alongside the citation
-    structure; **enforcing** it on the model is due when a consumer downstream parses the output.
-  - *Applicability condition:* your **product consumes the output as data** (renders components,
-    iterates fields, feeds another system) rather than showing prose to a human. If the deliverable
-    is prose a person reads, free text is fine and a schema is overhead. The failure it removes: a
-    brittle parser (regex / second LLM) between "the model said something" and "the frontend renders
-    it" — a piece that breaks silently on any format drift (prompt edit, model update, provider
-    swap).
-  - *Mechanism (same idea, three packagings):* OpenAI **Structured Outputs** (native param),
-    Anthropic **forced tool-use** (a tool whose `input_schema` is the shape, `tool_choice` pinned),
-    others via an **aggregator**. A library (Instructor) unifies them and adds validation retries.
-    *Build-vs-buy tension:* Instructor is itself a provider-abstraction layer — if you already funnel
-    calls through an aggregation Router (Phase 4), verify the two compose rather than fight over the
-    seam, and beware **stacking two retry layers** (the library's + the Router's). With two providers
-    and an existing seam, forcing the schema as a tool through your own Router can be lighter than a
-    second abstraction.
-  - *Structural caveat — form is not truth (link to guardrails, Phase 5):* a schema guarantees the
-    **shape** of the answer, never its **correctness**. A `Citation{standard, clause}` with a perfect
-    shape says nothing about whether that clause exists or the model invented it with impeccable
-    formatting. For a traceability corpus this is the same **emitting ≠ verifying** split above:
-    structured output cleans up *emission* (typed `{answer, citations[]}` instead of citations buried
-    in prose), it does **not** do verification — that stays a later generation-quality phase.
-  - *Streaming interaction:* if the *whole* response becomes one structured object, there is nothing
-    to stream token-by-token (partial JSON is ugly). This is an argument for a shape where the long
-    generated text stays streamable and the structure (citations, metadata) is a single terminal
-    event — the same split the streaming node in Phase 4 already wants.
+    structure; **enforcing** it on the model is due when anything downstream parses **or verifies**
+    the output — in a traceability system, verification is that consumer.
+  - *Applicability condition:* the product consumes the output as data, **or** you find yourself
+    writing detectors over the model's prose (sentence segmentation to find unsourced claims, a regex
+    for citation markers, prefix matching to classify refusals). Each detector is a heuristic over free
+    text; a schema turns it into a validated field. Measured: three prose heuristics retired at once,
+    and "sentence without a source" went from a measured 21% to impossible by schema (`refs` required
+    per statement). *Precondition:* the response is not streamed (Phase 4, streaming).
+  - *Shape that worked for a citing RAG:* sections → statements `{text, refs[], quote?}`, a
+    `not_found[]` list, a declared `status`. **The model declares; the code validates and composes.**
+    The served status is normalized by deterministic rules (a declared refusal carrying sourced
+    statements is served as `partial` — measured "refusals that cite" 4/42 → 0); markers and
+    product-voice sentences are composed in code; the stored history is the composition without
+    markers. Anything decidable in code is not asked of the model.
+  - *Mechanism — the route matters more than the API:* native structured output (constrained
+    decoding) vs. emulation through a forced tool. Same schema, measured: ~10% invalid outputs on the
+    forced-tool route (one query failing twice in a row), 0 on the native one. Which route you get may
+    be decided by the abstraction library's per-model capability table (Phase 4). Ship the schema
+    **fully expanded** (no `$ref`): one library emitted an unresolvable `$ref` on the tool route and
+    the model improvised keys (26 invalid in the first real pass — a trivial probe hadn't shown it).
+    Keep constraints the providers don't share (e.g. minimum items) as validators on the parsed
+    object. Retry once on an invalid schema; a second failure is a typed 502; a truncated JSON is a
+    typed truncation error, never retried blindly. If you stack a validation library on top of an
+    aggregation Router, beware two retry layers.
+  - *Cost:* on the same model, output tokens ×2.5 and latency ×1.8 vs. prose (JSON overhead). Paid
+    knowingly.
+  - *Structural caveat — form is not truth:* a schema guarantees shape, not correctness — a ref can
+    point at the wrong source and a quote can be edited. Structured output cleans up *emission*;
+    verification stays a separate layer (Phase 3.5, *Citation validation*).
 
 ---
 
@@ -839,8 +854,10 @@ exact (sequential scan), not approximate** — see the marquee decision below.
 
 - **Reranker (cross-encoder) — two measurements, not one, decide it.**
   - *Applicability condition (static):* a latency budget that can absorb a model in the critical path
-    **before the first token**. Read the reranker's cost as a fraction of **TTFT**, not in absolute ms
-    (measured on CPU: +1.5 s for 50 candidates ≈ one extra TTFT; +7 s for 400 ≈ four).
+    **before the first token**. Read the reranker's cost as a fraction of **user-perceived latency**,
+    not in absolute ms (measured on CPU: +1.5 s for 50 candidates ≈ one extra TTFT while streaming;
+    +7 s for 400 ≈ four. Without streaming the reference became the whole answer and the same cost is
+    +25% to ~2× — still not justified, since it bought no precision).
   - *Trigger signal — both halves required:* (1) **margin in the pool:** relevant items sit deeper
     than the top-k (measured: candidate recall 0.46 at 50 chunks → 0.70 at 400, at no retrieval-latency
     cost in the exact regime); **and** (2) **the model converts that margin into precision** — measured,
@@ -954,7 +971,9 @@ the failure modes are named.
   - *Bounded completion* (normative first, per-unit and per-request token caps): normative
     completeness 0.59 → 0.95 for **+36% context**; the caps bite on long annexes, as expected. Whether
     that extra context helps or dilutes the answer is a generation-quality question, not a retrieval
-    one — keep it as an option until generation is evaluated.
+    one — keep it as an option. With a generation harness it is a one-entry experiment; the rule has to
+    be **paired per query over the aggregate** (a 2-query stratum moved up to 0.47 between identical
+    runs), not "wins in the normative stratum". Not yet measured.
   - *The trace marks what expansion added* (retrieved vs. added): otherwise an audit can't tell what
     the search found from what was dragged along. Added chunks carry no distance — they were never
     ranked against the query.
@@ -976,13 +995,29 @@ the failure modes are named.
   *retrieved-but-not-cited* separately. *It also retires the "cut citations on refusal" bridge*
   (Phase 5): phantom citations came from attaching injected material; with marker-derived citations
   they can't occur, and the old rule only produced `[3]` in the text with no source underneath.
+  *Later mechanism, same principle:* with structured output the model declares `refs` per statement
+  instead of writing markers; citations are the union of validated refs — the regex retires, the
+  closed fan-out stays.
 - **Verbatim quotes give a deterministic support check — on a normative corpus.** Ask the model to
   quote the **minimal** literal span of a requirement next to its marker (`"…" [n]`); paraphrase
   inside a norm alters it anyway. Validate by substring against the cited group after normalizing
   **both** sides identically (Unicode NFKC, collapsed whitespace, re-joined line-break hyphens,
   unified quotes, stripped trailing punctuation). Run it in **observation mode** first — log, don't
-  reject — and decide the failure policy with the measured rate. Measured: zero false `not_found`
-  across the UAT, so normalization was sufficient.
+  reject — and decide the failure policy with the measured rate. *Correction from a larger
+  measurement:* zero false `not_found` in a 6-answer UAT did not hold over 42 answers — 5 of 16 were
+  validator false negatives (single vs. double quotes, a space next to `/`, a space after a hyphen).
+  Relax normalization only **monotonically** (accept more, never reject what was accepted) and prove
+  it on every previously verified quote (262/262 stayed verified) — the function is shared with
+  importers and past measurements. The rest were the model **editing inside the quotes** (elisions,
+  punctuation, one inserted *shall*); none was fabrication, so rejecting on `not_found` would have
+  rejected correct citations.
+- **Quote or paraphrase, never both.** With a separate `quote` field the model fills it with the exact
+  span and paraphrases the same content in `text`: 76 of 188 verified quotes never reached the reader,
+  and once surfaced next to the statement the answer read as repetition. Prompt rule — if a statement
+  only conveys what a requirement says, its text **is** the quoted span; own words only to synthesize,
+  compare or combine — plus a deterministic net: if the statement adds no content words of its own,
+  serve the quote alone (38 actions in 42 answers, 35 of them "the text already was the quote, without
+  quotation marks").
 - **In conversational RAG, the history must reach the retriever, not only the generator.** History
   designed for a CAG generator (resolve "it" against the prior turn) is correct there and broken in
   RAG: the question is *also* the retriever's query, and "And what does Q-ST-80C say about it?"
@@ -1001,7 +1036,10 @@ the failure modes are named.
   measured saying a standard "is not indexed" when it was. Phrase it about **the search** ("I could not
   find this in…"), which is true by construction. Expect the prohibition to be obeyed in the letter
   only (the model moved to "the indexed standards do not contain…"); the structural fix is a typed
-  output contract, not more prompt.
+  output contract, not more prompt. *Implemented:* absence gets its own channel — a `not_found[]` list
+  naming **aspects of the user's question** ("requirements that apply only to category C"), never
+  facts about the source ("category C rows in the matrix" reads as a normative absence) — and the
+  sentence that presents it is composed by code, in a separate block. Voice violations went to 0.
 - **Reading rules are the CAG inside the RAG.** What belongs fixed in the system prompt of a RAG over a
   normative corpus is not content but the corpus's *grammar*: obligation keywords ("shall" requirement,
   "should" recommendation, "may" permission), informative items are not binding, an enumerated list is
@@ -1037,13 +1075,28 @@ the failure modes are named.
     a small model. The rewrite only feeds retrieval, never enters the prompt as source, so it doesn't
     cross the citable frontier. *Measured:* none observed with users who chain questions on one topic.
 
-- **Citation validation — three levels, only two of them deterministic.**
-  - **Membership** (`[n]` exists in this request) and **literalness** (the quote is in the cited
+- **Citation validation — three levels; the third only partly deterministic.**
+  - **Membership** (the ref exists in this request) and **literalness** (the quote is in the cited
     source) are cheap and deterministic. **Support** (the source says what the sentence claims) is not:
-    measured on a table of near-identical rows ("category: X. Definition: …"), **1–2 answers in 6**
-    attributed a row to the wrong category with a quote that was **literal and correctly referenced**.
-    Passing the first two levels does not imply the third. The policy on unsupported citations needs a
-    faithfulness evaluation, not a substring.
+    measured on near-identical table rows, a literal, correctly referenced quote attributed a row to
+    the wrong category. Two refinements pushed part of the third level into code:
+    - *Misattribution:* when a quote is not in its cited source, search the **other injected
+      sources** — found elsewhere → `misattributed`, nowhere → `not_found`. Observed only between
+      **sibling sources** (adjacent clauses, same document and topic): the label sticks to the first
+      source of the topic. Recall and precision can't see it (both sources are relevant), so the
+      literal verdict stays a metric of its own. Policy: reassign the quote to where it was found, no
+      new call; the statement's own refs stay (it may legitimately rest on the original).
+    - *Modal edit:* a quote that matches only after removing modal verbs (*shall, should, may, must,
+      will, can*) on both sides → `modal_edit`. An inserted *shall* turns description into obligation:
+      authority inflation, caught without a judge.
+  - *Policy by verdict, no retries:* verified → serve; misattributed → reassign; cosmetic `not_found`
+    → serve, never presented as literal; `modal_edit` → serve with `needs_review`; invalid ref → drop
+    it, flag a statement left unsourced. Only an invalid schema triggers a retry. A policy that
+    corrects before serving needs a non-streamed response (Phase 4).
+  - *Trigger signal for a semantic layer* (judge or NLI **per citation** — the claim against the clause
+    it cites, not against the whole context): attribution errors the literal layers miss, observed in
+    use. Not built — none observed after structured output (0 misattributed, 0 modal edits in 125
+    structured answers).
 
 - **Securing the data layer of a RAG — authorization in retrieval, not keys on endpoints.**
   - *Applicability condition:* a corpus with **per-user permissions or multiple tenants**. Then the
@@ -1054,6 +1107,55 @@ the failure modes are named.
     runaway loops). Authentication follows the consumer: service-to-service → API key
     (constant-time compare), end user → session/JWT. *(Decided here, not built: public corpus, no
     public URL.)*
+
+### Measuring generation — the same stick, one layer up
+
+The retrieval stick measures what reaches the model; this one measures what the model does with it.
+Same rules as the golden set above (fixed set, real path, versioned artifacts), plus three that
+generation adds: **noise**, **asymmetry** and **degenerate strategies**.
+
+#### Patterns & practices
+
+- **Run the real request path; read what the product delivers.** The harness calls the production
+  answer function and reconstructs the source groups from the response, not from inside the service —
+  a parallel evaluation path drifts like any second delivery path. Multi-turn: generate the prior
+  turns once and replay the same history in every run, so only the judged turn varies.
+- **Deterministic citation metrics first** (when relevance is judged per citable unit):
+  *conditional citation recall* = relevant cited ÷ relevant **injected** (isolates the generator from
+  retrieval; without an "essential" grade it has no ceiling at 1 — read it comparatively), *citation
+  precision*, literal-verdict counts, and — for prose output — the unsourced-sentence rate. No judge,
+  no cost beyond generation, and they diagnosed everything that mattered: omission over invention
+  (first measurement: recall 0.65, precision 0.91, no failed quote was fabrication), misattribution,
+  edits inside quotes, refusals that cite. "Relevant = must cite" does not hold: with 16–55 relevant
+  units per query and 10 delivered, an "essential" grade is a separate annotation.
+- **Measure the noise floor before any A/B.** Identical runs of one configuration (≥3): global spread
+  ±0.03 here; per stratum with 2 queries, up to 0.47. Below the floor a difference is not a result,
+  and a two-query stratum decides nothing — compare **paired per query over the aggregate**.
+- **Preregister the decision rule — and write the domain's error asymmetry into it.** A symmetric
+  "precision may not drop more than 0.05" contradicted a product where omitting an applicable
+  requirement is worse than citing an extra one: a new model's +0.20 recall for −0.07 precision failed
+  it and was accepted as an explicit, documented exception. When a rule breaks, accept or reject in
+  the open; never move the threshold silently.
+- **Watch the degenerate strategy.** Conditional recall maxes out if the model cites everything it
+  receives (one query: 9–10 of 10). Report cited ÷ injected next to recall.
+- **Self-contained, immutable artifacts.** Each run writes answers, verdicts, injected sources **with
+  their text**, tokens, cost and fingerprints (corpus, system-prompt and user-message hashes, model,
+  configuration, golden-set version), never overwritten. A changed validator can then re-score old
+  runs at no cost — which is how a validator change was separated from an output-format change.
+- **A probe must exercise the real case.** A trivial probe validated a schema that failed on 26 of the
+  first real answers. The session's API cost was dominated by debugging passes (≈1.4 USD) against
+  ≈0.08 USD for a stable pass.
+
+#### Decision points
+
+- **RAGAS-style LLM-judged metrics vs. deterministic citation metrics.**
+  - *Applicability condition for RAGAS-style metrics:* no human relevance judgments per citable unit,
+    and a domain where "supported by the context as a whole" is good enough. *Not taken here:*
+    faithfulness checks each claim against the **whole** context, so a claim backed by source 3 but
+    cited as [1] scores as faithful (blind to misattribution); answer relevancy (questions regenerated
+    from the answer, compared by embedding) penalizes a correct abstention; and the library brings its
+    own LLM configuration beside your provider seam, with an API that changes between versions. Its
+    context metrics duplicate, noisier, what human retrieval judgments already measure.
 
 ---
 
@@ -1108,23 +1210,18 @@ on the provider seam (Phase 1) and the output contract (Phase 2).
   fake client, never opt-out — an autouse fixture that nulls the client), and (2) the project's
   own service doesn't publish the port to the host if only another container consumes it. This is
   learned the hard way: a test suite writing keys into a neighbor project's live store.
-- **Stream what improves perceived latency; don't stream what's secondary and cheap to paint at
-  once.** Stream the long generated text token-by-token; deliver structured metadata (citations,
-  usage, finish_reason) as a single typed terminal event, or in the non-stream response. Nobody
-  audits a citation in real time while it's being written. This keeps the stream simple and keeps
-  the streaming path *deletable*.
-- **The streaming path sits on top of the non-stream path, which is the source of truth.** Both
-  share one decision-and-assembly path (cache lookup, grounding, citation building); streaming
-  only changes *how* the result is delivered. Consequence: never put business logic that exists
-  *only* in the streaming path. If streaming misbehaves, it deletes cleanly — that's the design
-  criterion, because streaming is UX, not correctness.
-- **Any layer that can answer without calling the model decides whether there's a stream at all.**
-  A response cache above the provider layer is the canonical case: a hit never calls the model, so
-  there is nothing to stream. Look it up first; on hit, return whole; only on miss open the stream.
-  They don't interact beyond this — that layer decides *if* the request even enters the streaming
-  path. *(Generalize past the cache: a refusal short-circuit, a stored answer, or a guardrail
-  rejection has the same shape. What matters is the ordering — "can this be answered without
-  generation?" is resolved **before** the transport decision, never inside the stream.)*
+- **Streaming is decided by the verification policy, not by UX alone.** *(built, then removed)* If
+  the answer must be corrected or rejected **before** the user sees it (reassign a misattributed quote,
+  reject an invalid output, normalize a refusal that cites), there is no streaming — or there is
+  buffering, which cancels it. A stream leaves only post-hoc verdicts on text already on screen; for a
+  traceability product that is verify-after-serve, and it was removed. Measured cost: 1.8 s to first
+  token → 6.3 s for the whole answer (12.8 s later, with a reasoning model and JSON), judged acceptable
+  for a normative-lookup user with a single fixed waiting message. *What the deletion revealed:* two
+  invariants (the truncation flag, a typed provider failure) lived **only** in the stream path — two
+  delivery paths diverge, and invariants settle in the most-used one. *If you do stream:* one shared
+  decision-and-assembly path (the stream only changes delivery, so it deletes cleanly); a layer that
+  can answer without generation (cache hit, refusal short-circuit) decides **before** the transport;
+  long text streams, structured metadata goes in a single terminal event.
 - **Truncation is an integrity failure, not a cosmetic notice — when traceability is mandatory.**
   `finish_reason == "length"` may have cut the answer before its citation, yielding a normative
   claim with no anchor. Detect it and mark the response unreliable; do **not** try to prevent it by
@@ -1136,18 +1233,22 @@ on the provider seam (Phase 1) and the output contract (Phase 2).
   ships as a success — with its evidence attached behind a text that doesn't exist. A state field
   defaults to **"unknown"**, never to the good case, and a measurement nobody took is **`None`**,
   never a number (`distance = 0.0` reads as "identical to the query"). The empty answer itself is
-  then *named*, not delivered: an error event on the stream, a 502 on the request (well-formed
-  request, unusable upstream reply), and no assistant turn written to the session (an empty turn
+  then *named*, not delivered: a 502 on the request (well-formed
+  request, unusable upstream reply; an error event if streaming), and no assistant turn written to the session (an empty turn
   would be re-injected into the next question). *Residual:* a boolean derived from that field
   (`truncated = finish_reason == "length"`) inherits the problem — under "unknown" it says "not
-  truncated" when the truth is "don't know"; it wants to be three-state.
+  truncated" when the truth is "don't know"; it wants to be three-state. *With structured output:* a
+  truncated JSON can't be parsed → a typed truncation error, not retried (it would hit the same cap);
+  a cut output that still validates is served flagged `truncated`. Reasoning models spend the output
+  budget thinking — size the cap for it (16,000 here; one runaway used it all in 44 s).
 - **Structured logging is unconditional; the decision is *what fields*, not *whether*.** Use a
   structured logger (e.g. structlog) with dual rendering (human console in dev, JSON in prod) and a
   per-request `request_id` bound via middleware so one query's full trace (HTTP → cache → LLM →
   response) is reconstructable by filtering on that id. Minimum LLM-call fields: model_used,
-  provider, tokens in/out, cost, latency, cache_hit, fallback_used, finish_reason. For streaming,
-  time-to-first-token is the metric that justifies streaming (it measures the UX streaming
-  promises), separate from total latency.
+  provider, tokens in/out, cost, latency, cache_hit, fallback_used, finish_reason. If you stream,
+  time-to-first-token is the metric that justifies it; if you don't, the server latency of the whole
+  request (guardrails, retrieval, model) is the reference every added stage is read against. Log the
+  provider's exact input-token count on every call — it calibrates any estimate for free.
 - **Log metadata, not content, by default.** Structured logs capture prompts and can capture
   responses. Default to metadata (tokens, model, latency); the full prompt/response text is a
   data-exposure surface. Harmless for a public corpus, but a compliance concern (GDPR) for
@@ -1177,6 +1278,12 @@ on the provider seam (Phase 1) and the output contract (Phase 2).
   - *Note — resolve provider natively, not by string matching.* After normalization the response's
     model id may lose its provider prefix; derive the provider with the library's own resolver, not
     a `"claude"`/`"gpt"` substring heuristic that breaks on the third provider.
+  - *Note — pin the library's capability/pricing map.* One library downloaded its model map from its
+    main branch at every start, and that map decided not only prices but the **structured-output
+    route** per model: a remote change could alter behavior and break the comparability of
+    measurements without a deploy. Use the packaged map. Resolve cost from the response with the
+    library's own function (dated snapshot names may not resolve by name). Upgrading the library to
+    reach a new model is a supply-chain decision — inspect what the release adds before adopting it.
 
 - **Automatic fallback across providers.**
   - *Maturity:* normally production/SLA — but rises to MVP when the artifact is a **high-stakes
@@ -1314,8 +1421,9 @@ on the provider seam (Phase 1) and the output contract (Phase 2).
     **mode** (an environment-level switch that puts the system in a state fit to be measured, with a
     fail-fast guard against enabling it in production) is the durable part and stays; "what the mode
     disables" is whatever suppresses variance at the time. With the cache gone the mode has nothing
-    to disable **yet** — keep it, because provider-side prompt caching, memoized retrieval, or a
-    reranker cache each re-create the same adversary later.
+    to disable **yet** — keep it, because memoized retrieval or a reranker cache would re-create the
+    same adversary later. *(Provider-side prompt caching does **not**: it caches prefix computation,
+    not answers. An earlier version of this node listed it — wrongly.)*
   - *What did **not** survive, and is the honest cost of the retirement:* the exact-match cache was
     also the only mechanism making an identical repeated query return a byte-identical, identically
     cited answer. Removing it means **auditability of repeated queries now rests on model determinism
@@ -1376,30 +1484,38 @@ on the provider seam (Phase 1) and the output contract (Phase 2).
     semantic-cache abstraction genuinely saves work and its coupling is acceptable, it is a valid
     pick.)*
 
-- **Prompt caching (provider-native, e.g. Anthropic `cache_control`).** *(distinct from response
-  caching above — it doesn't skip the call, it discounts the repeated-prefix processing)*
-  - *Maturity:* deferred until the static prefix is large enough to matter.
-  - *Applicability condition / trigger:* the cacheable prefix exceeds the provider minimum (e.g.
-    ~1024 tokens). A small CAG prefix may not reach it, so it wouldn't even activate — not a lost
-    feature, just not-yet-applicable. Re-evaluate when retrieval inflates the prefix; **that** is
-    when to verify the aggregation library passes `cache_control` through rather than flattening it.
+- **Prompt caching (provider-native prefix caching).** *(implemented; distinct from response caching —
+  it doesn't skip the call, it discounts re-processing an identical prefix, and it does **not** change
+  the output distribution, so it doesn't interfere with evaluation)*
+  - *Applicability — three conditions, checked with numbers:* (1) the static prefix exceeds the
+    **model's** minimum cacheable length (model-specific — 512 tokens on the model used here, larger on
+    others; below it the flag is a no-op); (2) the **traffic pattern** — some providers charge cache
+    writes above normal input (1.25×) with a short TTL (5 min): on one pass, −10% cost with back-to-back
+    calls, **+2.8%** if every call arrived after the TTL; others cache automatically with no write
+    premium; (3) **prompt order** — only an identical prefix is cached: static instructions and schema
+    first, then history, then retrieved context and the question. The original layout put the
+    retrieved context inside the system prompt, making every prefix unique.
+  - *Decision here:* on (prefix ≈2,500 tokens; multi-turn sessions arrive in bursts; one configuration
+    for harness and production is simpler); the amounts are negligible either way.
 
-- **Streaming transport — SSE vs. StreamingResponse vs. WebSockets.**
-  - *Applicability condition:* unidirectional server→client token streaming → **SSE** (structured
-    events, auto-reconnect; the de-facto LLM standard). Raw text with no event structure →
-    StreamingResponse. Bidirectional (agent asking the user mid-task) → WebSockets — defer until an
-    agent phase actually needs it.
-  - *Mechanism caveat (framework-specific, learned in implementation):* with FastAPI's `fastapi.sse`,
-    SSE mode is a property of the **route** (declared `response_class` + a generator endpoint), not
-    decidable **per request**. You cannot return plain JSON on one request and SSE on another from
-    the *same* endpoint via this mechanism. Either use two routes, or format SSE by hand with
-    `StreamingResponse` — there's no middle path. (Practical consequence: a cache-hit on the stream
-    endpoint can just emit a single terminal event rather than switching to JSON.)
-  - *Note — two streaming legs, don't conflate:* an aggregation library normalizes the *provider→
-    backend* leg (one `async for` over normalized chunks); emitting `text/event-stream` on the
-    *backend→client* leg is your endpoint's job. "The library supports SSE" only covers the first
-    leg. (A separate `include_usage`-style stream option is typically required for the library to
-    include token counts in the stream at all.)
+- **Streaming transport — SSE vs. StreamingResponse vs. WebSockets.** *(closed with streaming; kept
+  for a product that does stream)* Unidirectional token streaming → SSE; raw text → StreamingResponse;
+  bidirectional → WebSockets (agent phases). Two legs not to conflate: the library normalizes
+  provider→backend, backend→client is your endpoint. With FastAPI's `fastapi.sse`, SSE is a property of
+  the route, not decidable per request. A usage option is usually required for token counts to appear
+  in a stream at all.
+
+- **Input-token budget — a hard cap before the call.**
+  - *Applicability condition:* a price or behavior cliff above some prompt size (the model used here
+    multiplies its price above 100k input tokens), or variable-size inputs (unsplit tables, long
+    multi-turn history, context expansion).
+  - *Mechanism:* estimate conservatively before calling (characters ÷ 2.5 here; ÷ 3 underestimated
+    this tokenizer), calibrated against the provider's exact count logged after every call
+    (estimate/real 1.00–1.26 over 42 runs); cap far below the cliff (30k vs. 100k; max observed 8.9k);
+    if over, drop whole citable units from the lowest rank, then the oldest history, and log what was
+    dropped (a stage that discards logs what it discarded); alert well above normal (50k). The case "the
+    question alone doesn't fit" closes at **input validation** — a maximum question length, rejected
+    before any effect — not mid-pipeline.
 
 - **Observability tooling — structured logs vs. a visual platform.**
   - *Maturity:* structured logs are MVP and unconditional (above). A **visual platform** (Logfire,
@@ -1512,6 +1628,10 @@ demonstrable*, it is not a second backend.
   don't enshrine what the code happens to do today.
 - **An inherited dependency is not a validated path.** Finding a library already in a sibling project's
   manifest doesn't mean the pattern that uses it was exercised there. Verify the path, not the presence.
+- **Evidence is shown on two axes: cited / in context but not cited × retrieved / added by
+  expansion.** A single "retrieved but not cited" bucket mixed what the search found with what
+  expansion dragged along. A refusal shows only its message in the main view; the evidence stays in the
+  contract and the diagnostic panel.
 - **Don't reconstruct backend state in the frontend to display it.** If a diagnostic panel wants the
   active system prompt or injected context and the backend doesn't expose it, leave it a `TODO` and add
   a backend endpoint — reconstructing it client-side is the coupling-by-reimplementation the thin-client
@@ -1527,8 +1647,7 @@ demonstrable*, it is not a second backend.
   so it rides the query response, never a global endpoint that RAG would invalidate.
   - *Revised once it became evidence — the trace is part of the contract, not an opt-in.* The first
     version gated the context behind a request flag, as a string blob. Once the context *is* the
-    retrieved evidence, it travels **always**, typed (a list of evidence atoms), in the response and
-    in the stream's terminal event. **An API contract does not depend on a flag or on the
+    retrieved evidence, it travels **always**, typed (a list of evidence atoms), in the response. **An API contract does not depend on a flag or on the
     environment**: a contract that forks by `APP_ENV` makes the tests evidence about a shape that
     isn't the deployed one. Hiding diagnostic noise is the **render's** job, governed by the
     *frontend's* own env variable and compared so that a typo **hides** rather than leaks. And the
@@ -1648,27 +1767,15 @@ read the maturity field, don't adopt the whole pipeline at once.
     the one that prevents a phantom citation when the corpus doesn't hold the answer. Both are the
     *filter* policy; instructed in the prompt, not a Python validator (real grounding verification is
     a later phase).
-  - *Bridge pattern until structured output — a natural marker phrase.* To act on a refusal (type it
-    in the response, log it) before you have a typed refusal field, have the model **begin the refusal
-    with a fixed natural phrase** (`"Out of scope:"` / `"I could not find this in the indexed …:"`) and
-    detect it by prefix at the shared assembly point. The phrase reaches the user verbatim, so it must
-    be in **product voice** and **true by construction**: about the search, never about the corpus
-    (Phase 3.5 — an earlier "Not covered by the indexed standards" asserted absences retrieval had
-    merely missed). Choose a *natural
-    phrase over a technical marker* deliberately: a technical token (`OUT_OF_MATERIAL:`) would have to
-    be stripped from the text, and on a streaming endpoint that means **buffering the stream start** —
-    streaming-only logic the "streaming is a deletable delivery layer" rule (Phase 4) forbids. A
-    natural phrase *is* the readable message: it streams as-is, detection happens on the assembled
-    text, not on bytes already sent to the client. **The streaming principle dictates the guardrail
-    mechanism.** It's a bridge — prefix detection is frail if the model doesn't emit the phrase
-    verbatim — that retires when structured output gives a typed refusal field. *Measured limit:*
-    a binary prefix can't express a **partial** answer, and prompting for "answer what you found, name
-    the gap at the end" failed with a small model (two rewrites; it still opened with the refusal
-    phrase when the named standard wasn't retrieved). The fix is a typed coverage field in the output
-    contract, not more prompt. *(Historical bridge, now retired: while citations were derived from the
-    injected material, a candidate citation attached unconditionally was a phantom citation on every
-    refusal, so citations were cut on detected refusal. Once citations come from the model's markers
-    the phantom can't occur, and the cut only hid real citations — a bridge rule outlived its premise.)*
+  - *Retired bridge — a natural marker phrase.* Before structured output, the refusal was typed by
+    having the model open with a fixed product-voice phrase detected by prefix (chosen over a technical
+    token because stripping a token from a stream needs buffering). It could not express a **partial**
+    answer (4 of 42 answers opened with the refusal phrase and then cited). *Now:* a declared `status`
+    (`answered` / `partial` / `out_of_domain` / `out_of_material`) normalized by code — sourced
+    statements make it `partial` whatever was declared — and the refusal text is composed by the
+    product. Both the prefix mechanism and its streaming justification are gone; what survives is the
+    rule *a bridge is justified by the mechanism under it — when the mechanism changes, re-justify it*
+    (Cross-cutting).
 
 - **Testing & evaluating a probabilistic component — two sovereign suites, not one with exceptions.**
   - *The reframe:* `assert == expected` doesn't apply to LLM output; you test **properties**, not
@@ -1701,10 +1808,10 @@ read the maturity field, don't adopt the whole pipeline at once.
     **consistency metric is citation stability, not text stability** — "do N runs cite the same
     clause?" beats variance of prose; and with a deterministic cache, consistency of *cached*
     questions is an **invariant, not a statistic** (the cache is reproducibility of the cited answer).
-  - *What is deferred (don't graduate as done):* the serious evaluation content — golden datasets,
-    LLM-as-judge, faithfulness/RAGAS, a library like DeepEval — is a later generation-quality phase;
-    it needs retrieval and fidelity to evaluate. Define the mode and the two suites now; populate the
-    evaluation suite then. Family-1 contract tests need only pytest + Pydantic, no eval framework.
+  - *Populated later (Phase 3.5, *Measuring generation*):* the retrieval golden set reused, a
+    generation harness with deterministic citation metrics, a noise floor and preregistered rules;
+    LLM-as-judge and RAGAS were evaluated and not taken. Contract tests still need only pytest +
+    Pydantic.
 
 - **Adapting output to a user profile ("tier") adapts generated output, not cited material.** *(by
   negation — the useful form of tier for a retrieval system)*
@@ -1729,18 +1836,13 @@ read the maturity field, don't adopt the whole pipeline at once.
     *pipeline* (not just a template) is an agent-phase concern; keep the dispatch point at the seam so
     you don't close that door, but don't build it now.
 
-- **Verifying citations (generation-quality phase, deferred) — the canonical shape is
-  generation/verification separation.** *(forward pointer, not an implemented node)* The
-  emitting≠verifying split (Phase 2) is closed, when its phase arrives, by separating **generation**
-  from **verification** in distinct calls (Self-Refine; and the three-role Actor/Critic/Boss, where
-  splitting *evaluation* from *decision* breaks the pure-Self-Refine failure modes: infinite
-  refinement and early-confirmation bias). In a retrieval system, "criticize the output" *becomes*
-  "verify the citation": an Actor generates answer + candidate citations, a Critic checks each claim
-  against the clause it cites, a Boss accepts / re-generates / suppresses unverifiable citations. An
-  `{answer, citations[]}` contract kept separate from v0 is already compatible with this — nothing to
-  undo. Maturity: it earns its place only when the error cost is high, the evaluation criteria are
-  clear, and the extra latency is tolerable; it is not an MVP node and does not graduate as
-  implemented until that phase.
+- **Verifying citations — deterministic verification in code first; a critic call only on signal.**
+  The emitting≠verifying split (Phase 2) was closed **without** a second model call: the model declares
+  statements with refs and quotes; the code verifies (membership, literalness, misattribution, modal
+  edits) and decides (serve, reassign, flag) — the Actor/Critic/Boss shape with Critic and Boss as code.
+  A critic or judge call (Self-Refine, Actor/Critic/Boss) earns its place only for the **support** level
+  the code can't check: when errors the literal layers miss are observed, the criteria are clear and
+  the extra latency is tolerable. Not built — no such errors observed yet.
 
 ---
 

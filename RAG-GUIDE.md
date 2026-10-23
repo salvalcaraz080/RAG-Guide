@@ -914,6 +914,19 @@ each later technique becomes a one-line experiment.
   carries a literal quote validated against the clause; a non-expert reviewer then only does reading
   work (does the quote exist and answer?) — the code does the existence check. Run on a subscription
   rather than an API, it cost nothing marginal.
+- **Verifying judgments with an independent LLM session — hardening that took three protocol
+  versions.** Same isolation as the annotator, plus: (1) the verifier returns **facts, never your
+  categories** (was it in the context? where in the corpus? what points there?), and **code** maps
+  facts to categories; (2) **phase order is enforced by the workflow** — the context file doesn't
+  exist until a command reveals it after phase 1 is written, and phase 1's hash is stored outside the
+  workspace; (3) a pointer counts only if it is **literal**, checked with the **same reference parser
+  the product uses** — inferred destinations ("this names a template, which lives in annex E") made
+  5 of 5 false positives; (4) **primary answers** (≤3, answering the gap *as phrased*) separate from
+  related ones, and an explicit "does it exist as phrased?" field — a verifier that finds the general
+  topic will mark a qualifier that doesn't exist ("flight-specific") as found. *Independence is of
+  context, not of model:* keep a human anchor on disagreements plus 2–3 random cases. *And the
+  classifier's own bias:* looking for pointers only toward where you already believe the answer is
+  biases toward "no pointer" — the protocol requires reading every pointer.
 - **Two recalls, capped, plus depth.** Precision@k (k = citable units actually delivered) is the robust
   column. Recall needs a **cap** (hits ÷ min(|relevant|, slots)) or it mixes inability with a
   structural ceiling; measure it at the delivered k **and** over the candidate pool, and sweep pool
@@ -971,13 +984,19 @@ the failure modes are named.
   - *Bounded completion* (normative first, per-unit and per-request token caps): normative
     completeness 0.59 → 0.95 for **+36% context**; the caps bite on long annexes, as expected. Whether
     that extra context helps or dilutes the answer is a generation-quality question, not a retrieval
-    one — keep it as an option. With a generation harness it is a one-entry experiment; the rule has to
-    be **paired per query over the aggregate** (a 2-query stratum moved up to 0.47 between identical
-    runs), not "wins in the normative stratum". Not yet measured.
+    one — decide it with the generation harness, **paired per query over the aggregate** (a 2-query
+    stratum moved up to 0.47 between identical runs), not "wins in the normative stratum". *Measured:*
+    it dilutes nothing (recall 0.90 → 0.91, precision 0.86 → 0.90, every literal verdict unchanged,
+    cost ×1.12, latency flat) — a tie by the aggregate rule. What decided it was the stratum the golden
+    set lacked: **explanatory "what is / what does X contain" questions**, where with orphans-only the
+    answer cited 4 of a template's requirements and reported the rest "not found", and with bounded
+    completion cited 9–11 with no absence block. Adopted as default by explicit exception, to confirm
+    once that stratum exists. *(Lesson: a tie on the aggregate can hide a stratum you never sampled.)*
   - *The trace marks what expansion added* (retrieved vs. added): otherwise an audit can't tell what
     the search found from what was dragged along. Added chunks carry no distance — they were never
     ranked against the query.
-  - *Completing a unit ≠ following its references.* 4 of 6 orphan notes said "see clause X" — about a
+  - *Completing a unit ≠ following its references* (the fork is a decision point below — *reference
+    traversal*). 4 of 6 orphan notes said "see clause X" — about a
     **different** clause. Expansion brings the note's own requirement; what the reader wanted was the
     referenced clause. That is reference traversal, a separate mechanism with its own validation.
 - **Context block: tagged sources with opaque per-request handles.** Each group is a `<source id="n">`
@@ -1073,7 +1092,45 @@ the failure modes are named.
   - *Trigger signal:* contamination **observed in real use** (retrieved sources from the previous
     topic after a self-contained new question) → condense the follow-up into a standalone question with
     a small model. The rewrite only feeds retrieval, never enters the prompt as source, so it doesn't
-    cross the citable frontier. *Measured:* none observed with users who chain questions on one topic.
+    cross the citable frontier. *Measured:* none observed with users who chain questions on one topic;
+    **observed once** on a deliberate topic switch (a "what is the development plan" turn after a
+    safety question did not retrieve the plan's template, which the corpus has). Signal registered;
+    condensation not yet built.
+
+- **Reference traversal — follow explicit cross-references deterministically before anything
+  smarter.**
+  - *Applicability condition (static):* a corpus whose units cite each other **by identifier**
+    ("see clause 6.2.7 of standard X", "Table D-2") — standards, contracts, regulations, specs. In a
+    normative corpus, **guidance documents cite the binding text by number**: without traversal, a
+    generic question is answered from the guidance alone while the requirement it names never arrives.
+  - *Trigger signal (dynamic):* classify the generator's "not found" aspects against the corpus
+    (see Phase 3.8, *diagnose the shape*). Many gaps whose answer sits behind a **pointer already in
+    the injected context** = traversal territory. Measured: that class covered 9 of 14 queries; the
+    class that would need a plan/fan-out covered 0.
+  - *Mechanism, cheapest rung:* at query time, parse the references in the **injected** text,
+    normalize the cited unit (revision-less and bracketed forms → the corpus edition; ambiguous or
+    out-of-corpus → don't expand, log the reason), resolve each with a **lookup by identifier**
+    (unit + its sub-units — "clause 6.2.7" is answered by 6.2.7.1…), cap it (here 5 units, per-unit and
+    total token caps), and append the result **after** everything retrieved, marked as added: it gets
+    the highest handles, so the input budget drops it first without special code. One hop, forward
+    only, no LLM, no loop. Off by default until measured; byte-identical to the previous path when off.
+  - *Two traps:* a **table label** ("Table D-2") is not an id in the chunks — derive the label → unit
+    map from document order and validate it against an independent source (the documents' own table
+    lists: 43/43; the naive "n-th unit with tables" rule failed 659/1,024). And the **UI must say why a
+    unit was added** ("by cross-reference" vs "to complete the clause") — deducible while there are two
+    expansion mechanisms, a contract field once there are more.
+  - *Measured, and decided outside the rule:* content arrived for every targeted gap; 2 of 6 resolved
+    with a literal quote, 4 of 6 cited by handle (paraphrased). The preregistered rule failed on two
+    mis-specified metrics (Measuring generation, below) and one real cost (latency +30% stacked on
+    bounded completion). **Adopted by product priority**: in a traceability product, answering from
+    guidance while the cited requirement exists is worse than a slower answer; latency became an
+    objective with its own levers, not a guard.
+  - *What it does not reach — the next node, not built:* **implicit** edges no text states (a clause
+    and its row in an applicability matrix; siblings under one parent; a requirement and the template
+    of its expected output), **name-based** edges (a document type named without a number → its
+    template annex), references to a **whole unit** (re-searching inside the target needs a
+    reformulated query), and **authority preference** (binding text over guidance in ranking). That is
+    a reference graph, decided separately.
 
 - **Citation validation — three levels; the third only partly deterministic.**
   - **Membership** (the ref exists in this request) and **literalness** (the quote is in the cited
@@ -1135,7 +1192,23 @@ generation adds: **noise**, **asymmetry** and **degenerate strategies**.
   "precision may not drop more than 0.05" contradicted a product where omitting an applicable
   requirement is worse than citing an extra one: a new model's +0.20 recall for −0.07 precision failed
   it and was accepted as an explicit, documented exception. When a rule breaks, accept or reject in
-  the open; never move the threshold silently.
+  the open; never move the threshold silently. *Preregistration protects against bias, not against a
+  mis-specified criterion:* when the rule turns out to measure the wrong thing, don't re-read it on
+  the data that exposed the flaw — adopt or reject by **explicit exception** with its reason, and
+  preregister the corrected metric for **new** data. Guards also encode product priorities: demoting
+  one (latency, from guard to objective) is a product decision, written down as such.
+- **A metric conditioned on what was injected penalizes any technique that adds relevant context.**
+  Conditional recall (relevant cited ÷ relevant injected) is right for isolating the generator and
+  wrong for judging expansion, traversal, reranking or a graph: reference traversal grew the
+  denominator 38% and the numerator 19% — **37 more relevant units cited in absolute terms** — and the
+  ratio read as −0.08. For techniques that change *what is injected*, report recall over the relevant
+  units **retrieved by the base search**, plus **absolute** relevant-cited counts, so omission and
+  substitution separate. (The substitution was real — 22 retrieved relevants no longer cited — and
+  partly desirable: guidance replaced by the binding text it cited.)
+- **The success criterion must measure what the product accepts.** "Resolved" was written as "cited
+  with a verified literal quote" while the product accepts quote **or** paraphrase with a handle; the
+  content arrived and was cited, and the rule scored it as failure (2 of 6 vs 4 of 6). Derive the
+  criterion from the acceptance policy, then check the metric isn't moved by the technique itself.
 - **Watch the degenerate strategy.** Conditional recall maxes out if the model cites everything it
   receives (one query: 9–10 of 10). Report cited ÷ injected next to recall.
 - **Self-contained, immutable artifacts.** Each run writes answers, verdicts, injected sources **with
@@ -1158,6 +1231,53 @@ generation adds: **noise**, **asymmetry** and **degenerate strategies**.
     context metrics duplicate, noisier, what human retrieval judgments already measure.
 
 ---
+
+## Phase 3.8 — Agency: does the pipeline need a decision layer?
+
+A working RAG is a **workflow**: you wrote the sequence (retrieve → generate → verify), the model fills
+the slots. An agent is the same pieces with one line changed — the **model chooses the next step** in a
+loop. Everything else (cost, latency, testability, observability) follows from that line, so the
+question is never "how do I build an agent" but "what does my pipeline fail at that only a runtime
+decision fixes". Here the answer, after measuring, was *nothing yet*: the shape problem that existed
+was solved one rung down.
+
+### Patterns & practices
+
+- **Diagnose the shape before adding agency.** The generator's "not found" aspects are the signal
+  (not citation recall, which is conditioned on what was injected and measures omission). Classify
+  each against the whole corpus, with verbatim evidence: **in the context already** (generator
+  omission → prompt/model, not agency) · **behind a pointer in the context** (reactive, one hop) ·
+  **reachable by a sub-query a plan would issue from the question alone** (predictable fan-out) ·
+  **deeper in the same ranking** (ranking) · **unreachable** (vocabulary/structure) · **outside the
+  corpus** · **not stated by the domain**. Only the two shape classes justify orchestration. Group
+  paraphrased repeats into one aspect per query, preregister the decision threshold, and count
+  **distinct queries**, not aspects. Measured: pointer class in 9 of 14 queries, plan class in 0.
+- **Invariants live in code; the model gets only the decisions that depend on the case.** "Always run
+  validation before answering" written into a prompt makes validation probabilistic; a tool whose
+  description states a precondition ("only call after…") enforces nothing — the tool checks it, or it
+  isn't a tool but the code step after the loop. Verification, handover to review (decided by a
+  deterministic verdict, not by the model's self-declared confidence) and output composition stayed
+  in code.
+- **Promote, don't rebuild.** If a decision layer ever comes, the pipeline's steps (search, lookup by
+  id, validation) become its tools; the lookup-by-id primitive built for deterministic traversal is
+  already one.
+
+### Decision points
+
+- **Task → workflow → dynamic workflow → agent.**
+  - *Maturity:* the fixed workflow is the default and stays it until a measured gap says otherwise.
+  - *The rung most material skips:* a **dynamic workflow** — one structured call produces the plan
+    (sub-queries, components), code executes it (fan-out, in parallel), one call synthesizes. The shape
+    varies per input; the model still doesn't steer. "The shape varies" is **not** the criterion for an
+    agent.
+  - *Applicability condition for a loop:* **the next step depends on observing the previous result**,
+    and that dependency can't be met by a deterministic hop. A pointer to a specific unit is met by
+    lookup (Phase 3.5, *reference traversal*); a pointer to a whole document that needs a
+    reformulated search inside it might not — that is the remaining candidate, unmeasured.
+  - *Trigger signal:* the shape diagnosis above, after the deterministic rungs are in place, still
+    leaves gaps a loop would close — and the gain survives the harness against the loop's latency.
+  - *Cost read for a low-volume, high-value product:* money is rarely the blocker (a four-configuration
+    measurement cost ≈0.4 USD); **latency** and **evidence** are.
 
 ## Phase 4 — Production-hardening the service (provider robustness, caching, streaming, observability)
 
@@ -1555,7 +1675,11 @@ on the provider seam (Phase 1) and the output contract (Phase 2).
     being stateless (each query now needs its state → session affinity or a shared store). An
     in-memory dict is fine for a bootstrap **only with a single worker** — with `--workers N`, turn 2
     can land on a worker that lacks the session; write that as a *condition*, and defer the shared
-    store (Redis/PG), TTL, and federation to a deployment phase. It composes with the fail-policy
+    store (Redis/PG), TTL, and federation to a deployment phase. *Store turns, not messages:* a turn
+    is (question, intermediate messages…, answer) and every window, budget cut and serialization
+    counts **turns** through one flattening point. A "2 × N messages" window breaks silently the day
+    a turn carries tool calls — and a cut through a call/result pair is a provider error. Migrated
+    with a byte-identical message-array test fixed before the refactor. It composes with the fail-policy
     test above: session state is **not degradable** (its absence changes the answer) → a
     provided-but-absent `session_id` is a **loud error**, never a silently-single-turn answer.
     *And enforce the condition, don't merely write it:* a startup guard that refuses
@@ -1941,7 +2065,11 @@ way — mostly in the data layer, but they generalize.
   belief behind. *And a concurrency test must count the work done* while *the call is in flight, not in
   total:* a heartbeat tallied after the awaited call returns reaches the same total whether the loop
   stayed free or starved — it just arrives later; count the ticks that occur *during* the outstanding
-  call (19 free vs 0 starved), or the green proves nothing. *The general form of several of these: an
+  call (19 free vs 0 starved), or the green proves nothing. *A guard inside a fault-tolerant system
+  must fail at teardown, not at the call:* a test-suite network block that only raises is swallowed by
+  the system's own fallback and typed errors, and the test passes — record every attempt and fail the
+  test when it ends. (Socket-level blockers also break some event loops that build their self-pipe
+  over loopback TCP; measure on the target OS.) *The general form of several of these: an
   instrument measured with, or against, the thing it verifies cannot detect that thing's omission.* A
   count gate taken with the drop predicate is blind to what the predicate misses ("Diagnose before
   you repair"); a table-conservation check summing the parser's output against the parser's own list

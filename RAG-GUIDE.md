@@ -16,8 +16,11 @@ A distilled, retroactive guide for starting **any** RAG project. It answers, at 
   - *Trigger signal* — **dynamic** symptom, observed at runtime, that says *now it's time*.
   Unconditional practices carry no schema — there the question is *how*, not *if*. Don't force
   the template.
-- **Only implemented-and-validated knowledge lives here.** It converges; it does not accumulate
-  theory. If something is merely read, it isn't in this guide yet.
+- **Validated knowledge is the core; theory enters only as a decision a future project would face.**
+  What was built and measured carries its numbers. A technique that was only studied enters as a
+  decision point with its condition and signal, marked *(not exercised here)*, so a reader knows
+  which claims were tested and which were reasoned. It converges; it is not a technique catalog — a
+  read idea that changes no decision stays out.
 
 ---
 
@@ -1125,12 +1128,48 @@ the failure modes are named.
     bounded completion). **Adopted by product priority**: in a traceability product, answering from
     guidance while the cited requirement exists is worse than a slower answer; latency became an
     objective with its own levers, not a guard.
+  - *Pointers to a **whole document** — measured, not adopted.* The cheapest rung is a conditional
+    edge, not a loop: pointer to a unit → lookup by id; pointer to a document → the **same query and
+    the same vector** re-run filtered to that document (one extra DB query, +68 ms median; skip it
+    when the document is already in the routing filter). It resolved 1 of 6 targeted gaps; a
+    retrieval-only pre-check had already bounded it at 2. The *why-not* breakdown is the lesson:
+    - **Following a pointer is not bringing something relevant.** A filtered search always returns
+      something (no distance floor), and a generic remark ("see the risk-management standard") fires
+      on every query that injects it: 207 units added in 10 of 14 queries, 100 cited, 14 judged
+      irrelevant, and in two queries none cited.
+    - **Shared slots in order of appearance starve late pointers.** A document whose answer sat at
+      rank 2 never entered, because the same text named five clauses first. Priority between pointers
+      (edge type, authority, relevance) must be an explicit decision, not an effect of text order.
+    - **Reformulating inside the target** — the step that would need a model, and the last candidate
+      for an agent loop — **had no real case**: of 5 unresolved gaps, 3 were slot policy, 1
+      generation, and the 1 query-side miss was a delegation the domain never states.
   - *What it does not reach — the next node, not built:* **implicit** edges no text states (a clause
     and its row in an applicability matrix; siblings under one parent; a requirement and the template
     of its expected output), **name-based** edges (a document type named without a number → its
-    template annex), references to a **whole unit** (re-searching inside the target needs a
-    reformulated query), and **authority preference** (binding text over guidance in ranking). That is
-    a reference graph, decided separately.
+    template annex), and **authority preference** (binding text over guidance in ranking). That is a
+    reference graph, decided separately. Requirements it inherits from the measurements above: a
+    **relevance gate** before following an edge (next node), **explicit priority** between edges, an
+    accumulator keyed by unit id under one budget (one unit reached by two paths enters once), and the
+    **origin** of each added unit as a contract field.
+
+- **Relevance gate for added context — threshold, cross-encoder or LLM judge.** *(rungs 2–3 not
+  exercised here)*
+  - *Applicability condition:* any mechanism that adds context by rule rather than by ranking
+    (completion, reference traversal, a graph) and can therefore add irrelevant units.
+  - *Trigger signal:* budget cuts on added context, or added units the generator never cites.
+  - *Rungs, cheapest first:* a **distance floor** on what an edge brings → a **cross-encoder** score
+    (Phase 3.5 measured one that failed on hard negatives; re-measure on *added* units, not the base
+    ranking) → an **LLM judge**: one structured call that returns the ids to keep. The judge is a
+    workflow step, not an agent (no loop, no next-step choice). It is the only rung that decouples
+    *gathering candidates* from *choosing what enters*, so a graph could gather wide and let it pick —
+    and it introduces no generated text into the prompt (it selects ids; validate them ⊆ candidates).
+  - *Against it, in an omission-averse domain:* a filter fails by **silently dropping** an applicable
+    unit — the worst error class — and leaves no trace the user sees (a `not_found` does). The
+    generator already filters its context (it cited 71 relevant of 100 added units); a pre-filter
+    competes with that, not with the noise. And it is one more model call **before** generation,
+    where model time is already > 90% of the turn.
+  - *Decide offline first:* the golden set's per-unit relevance judgments score all three rungs as
+    filters (recall and precision of what they keep) with no generation and no production latency.
 
 - **Citation validation — three levels; the third only partly deterministic.**
   - **Membership** (the ref exists in this request) and **literalness** (the quote is in the cited
@@ -1215,6 +1254,15 @@ generation adds: **noise**, **asymmetry** and **degenerate strategies**.
   their text**, tokens, cost and fingerprints (corpus, system-prompt and user-message hashes, model,
   configuration, golden-set version), never overwritten. A changed validator can then re-score old
   runs at no cost — which is how a validator change was separated from an output-format change.
+- **Bound the achievable success before paying for generation.** For a technique that changes what is
+  injected, run only its retrieval over the targeted cases and check whether each answer unit enters
+  the context. That pre-check put the ceiling at 2 of 6 against a criterion of 3, before any model
+  call; the pass gave 1. Measure anyway (the guards, the per-stage latency and the why-not breakdown
+  are the output), but tune nothing to the pre-check.
+- **Report *why not* per unresolved target, by cause.** "Not detected / not resolved / over the slot
+  limit / not in the slot / brought but not cited / cut by budget" turns a failed criterion into the
+  specification of the next step — here it showed the expensive option (a reformulating loop) had no
+  case.
 - **A probe must exercise the real case.** A trivial probe validated a schema that failed on 26 of the
   first real answers. The session's API cost was dominated by debugging passes (≈1.4 USD) against
   ≈0.08 USD for a stable pass.
@@ -1232,14 +1280,15 @@ generation adds: **noise**, **asymmetry** and **degenerate strategies**.
 
 ---
 
-## Phase 3.8 — Agency: does the pipeline need a decision layer?
+## Phase 3.8 — Agency and orchestration: does the pipeline need a decision layer, or a framework?
 
 A working RAG is a **workflow**: you wrote the sequence (retrieve → generate → verify), the model fills
 the slots. An agent is the same pieces with one line changed — the **model chooses the next step** in a
 loop. Everything else (cost, latency, testability, observability) follows from that line, so the
 question is never "how do I build an agent" but "what does my pipeline fail at that only a runtime
-decision fixes". Here the answer, after measuring, was *nothing yet*: the shape problem that existed
-was solved one rung down.
+decision fixes". Here the answer, after measuring twice, was *nothing*: every shape gap was closed —
+or ruled out — one rung down. The orchestration question (framework or own code) is separate and
+comes second: it depends on the **shape of the flow**, agent or not.
 
 ### Patterns & practices
 
@@ -1272,12 +1321,121 @@ was solved one rung down.
     agent.
   - *Applicability condition for a loop:* **the next step depends on observing the previous result**,
     and that dependency can't be met by a deterministic hop. A pointer to a specific unit is met by
-    lookup (Phase 3.5, *reference traversal*); a pointer to a whole document that needs a
-    reformulated search inside it might not — that is the remaining candidate, unmeasured.
+    lookup, a pointer to a whole document by a filtered re-run of the same query (Phase 3.5,
+    *reference traversal*). The candidate that remained — reformulating the search inside the target —
+    was measured and had no case.
   - *Trigger signal:* the shape diagnosis above, after the deterministic rungs are in place, still
     leaves gaps a loop would close — and the gain survives the harness against the loop's latency.
+    Split every unresolved gap by cause (slot policy · query · generation): only the query-side ones
+    are a loop's to close.
   - *Cost read for a low-volume, high-value product:* money is rarely the blocker (a four-configuration
     measurement cost ≈0.4 USD); **latency** and **evidence** are.
+  - *A bounded self-correction cycle* (verification fails → regenerate once, told which citations
+    failed → else degrade) **is** a loop by the criterion above. Its trigger is a verification failure
+    rate above zero (here 1.00 verified — nothing to recover). If built, log the retry as an event:
+    otherwise the first-pass rate vanishes from the metrics and the retry masks a degrading generator.
+
+- **If you do build a loop — the decisions it brings.** *(not exercised here)*
+  - *State lives in the client, not the provider.* Server-side conversation state (a previous-response
+    id) binds the loop to one provider and breaks fallback; client state costs re-sending, which the
+    **prefix cache** absorbs. Reasoning artifacts are **not portable** between providers: a fallback
+    can happen before the first turn, or restart the loop — never continue it.
+  - *Structured output and tools coexist through a terminal tool* (`submit_answer` whose schema is the
+    output contract): forced on the last turn, it is also the **degraded exit** when limits are hit —
+    return what was gathered with its gaps declared, not "max steps exceeded".
+  - *Limits are multidimensional:* turns, total tool calls (one turn can carry twelve parallel calls),
+    **accumulated tokens** (input grows quadratically with turns — doubling max turns quadruples the
+    worst case) and wall time. A cycle needs a counter in its own logic; the framework's recursion
+    limit is the safety net, not the strategy.
+  - *Three error classes:* transient (the code retries, the model never sees it) · model error (invalid
+    argument, unknown id → an informative observation) · internal bug (fail loud: log and abort or
+    degrade — never turned into an observation the model "handles").
+  - *Prefix cache vs. compaction:* summarizing or dropping old observations rewrites the history and
+    breaks the cached prefix from that point. Grow only at the end while the cache pays; compact near
+    the context limit or with huge observations.
+  - *Citable context = the union of every turn's retrieval*; verification runs after the loop, on that
+    union, and the trace says in which turn each cited unit entered. Evaluate trajectories (turns,
+    calls, cost and latency per question, non-convergence rate), not only the final answer.
+
+- **Orchestration framework vs. own orchestration — decide by the shape of the flow.**
+  - *The ladder:* one model call (+ output format) → nothing to orchestrate · a single agent in a
+    ReAct loop → a hand-written, instrumented loop (or a framework's one-line agent) · a **real graph**
+    (dependencies, branches, parallelism, persist-and-resume, human approval mid-flow) → a graph
+    framework (LangGraph's `StateGraph`; role-based and conversational frameworks are the other two
+    models, plus vendor agent SDKs and typed Python options like Pydantic AI).
+  - *The real triggers are fewer than the ladder lists.* A branch is an `if`; parallelism is
+    `gather`/`TaskGroup`. What a framework saves you from re-implementing badly is **durable execution**
+    (persist state per step and resume after a crash), **pausing for a human** and resuming, and
+    **per-node observability** for free. If you need only resumption, a durable-execution engine
+    (Temporal and similar) is the alternative outside the agent ecosystem.
+  - *A graph is not a reason for a graph framework.* A fixed-edge graph is a workflow, and every
+    pipeline already is one, implicitly. Measured here: route → retrieve → expand → traverse →
+    generate → verify, one conditional edge at the end, ~17 s request-response, no pause. Of the four
+    graph primitives (typed state, function nodes, conditional edges, checkpointer) it already had
+    three; the missing one had no case. Not adopted.
+  - *The complexity tax:* dependency surface, indirection, scaffolding and **API migrations** (agent
+    constructors renamed between major versions). Measure the existing loop or pipeline as the
+    baseline: if re-expressing it as a graph gains nothing measurable (clarity, recovery,
+    observability), the framework is surplus.
+  - *Model-agnostic, with fine print:* graph nodes that call **your** provider seam stay agnostic; a
+    framework's prebuilt agent brings its own chat-model abstraction that duplicates your seam and its
+    fallback. If one enters, keep it at the graph layer. It orchestrates; it does not replace the call
+    layer or the output contract.
+  - *Shared state has a hidden cost:* every node sees the whole state, so its real inputs vanish from
+    its signature (`chunks → context` declares a contract; `State → dict` doesn't). It pays when node
+    order varies; in a fixed chain it is coupling without benefit. Separating work (stages) from
+    control (one place that decides the sequence) is good practice **without** a framework.
+  - *Trigger signal to reopen:* needing persistence **between steps of one request** — not between
+    turns, which conversation history already covers.
+
+- **Execution state and persistence (checkpointer).** *(not exercised here)*
+  - *Short vs. long memory:* short-term memory is the **thread** — a multi-turn conversation, which a
+    server-side turn history already is (`session_id` ≡ `thread_id`). Long-term memory is durable
+    business data across sessions; it lives in the business store, never in the checkpointer — and in
+    a traceability corpus it is contraindicated altogether (Phase 4, *Multi-turn conversation state*).
+  - *Applicability condition for a checkpointer:* resuming mid-run is worth more than repeating the run
+    (long or expensive runs), or a pause happens **mid-pipeline after expensive work**, or the person
+    who decides is **not** the person who asked (an approver). In a conversational product a
+    clarifying question is a **turn**: history carries the context to the next request, no pause
+    machinery needed.
+  - *Requirements when adopted:*
+    - **Idempotent accumulators by construction.** A list-concatenating reducer duplicates entries when
+      a node retries or a run resumes with accumulated fields in its input; "pass only new inputs on
+      resume" is a ritual someone will forget. Merge by key.
+    - **Lean state:** ids and distilled results, not raw model responses — every byte is serialized
+      at every transition (hundreds of KB turn a checkpoint write into the bottleneck). In a versioned
+      corpus a persisted id is reproducible only **with its corpus version**.
+    - **Failure domain:** a checkpointer compiled into the graph turns a degradable concern into a
+      non-degradable one — a failed write kills the run (Phase 4, *degradability test*). Sharing the
+      application database also shares its connections and load.
+    - **Retention:** checkpoint tables grow without bound and store user inputs — a data-retention
+      policy (GDPR), not an afterthought.
+    - **Human interrupts re-run the node from its start** on resume: work before the pause must be
+      cheap and idempotent; the expensive part goes after it.
+
+- **Parallel fan-out — measure before you parallelize.**
+  - *Trigger signal:* a per-stage latency breakdown (Phase 4) shows the parallelizable stage is a
+    meaningful share of the turn. Measured here: model generation was **93–94%** of a ~17 s turn;
+    retrieval, completion and traversal together < 0.3 s — parallelizing them saves hundreds of ms.
+  - *Mechanics (not exercised here):* `gather`/`TaskGroup` returns results in dispatch order with no
+    shared state to merge; a graph framework's fan-out merges branch outputs through a reducer and
+    makes order a property to verify — and order matters when rank sets citation handles. Bound
+    concurrency (rate limits); the gain holds for I/O, not CPU-bound work in one process; decide the
+    policy for a failed branch (`return_exceptions` and an explicit rule for the gap).
+
+- **Errors in an orchestrated flow.** *(not exercised here, beyond the existing retry policy)*
+  - *Each failure type gets its own response:* transient → retry with backoff · persistent dependency
+    outage → alternative path + **circuit breaker** · crash from an external cause → resume from the
+    last checkpoint · **deterministic bug → neither retry nor resume: fail fast and loud** (resuming
+    re-runs the same input into the same bug) · low confidence or ambiguity → a human gate.
+  - *Retries live in one layer, with a predicate.* An aggregation router that already retries plus a
+    per-node retry policy multiplies calls (3 × 3 = 9 per failure); a retry without a predicate also
+    retries bugs.
+  - *Degradation must be visible in the contract*, not only in internal state: a timed-out expansion
+    recorded in an `errors` field nobody serves yields an incomplete answer that looks complete — the
+    worst outcome where omission is the costly error. Surface it through the answer status.
+  - *Gate on a deterministic signal* (citation verification), not on a confidence the model reports
+    about itself; one gate at the critical point, not one per step.
 
 ## Phase 4 — Production-hardening the service (provider robustness, caching, streaming, observability)
 
@@ -1369,6 +1527,17 @@ on the provider seam (Phase 1) and the output contract (Phase 2).
   time-to-first-token is the metric that justifies it; if you don't, the server latency of the whole
   request (guardrails, retrieval, model) is the reference every added stage is read against. Log the
   provider's exact input-token count on every call — it calibrates any estimate for free.
+- **Break latency down by stage before choosing a latency lever.** Total latency says nothing about
+  where to act. One timer per request held in a context variable (so an injected seam — the
+  retrieval provider — marks its own stages without changing its protocol); stages only wrap existing
+  code, they decide nothing; one event per request emitted from a `finally` (a failed request still
+  reports the stages it reached); an `unaccounted` remainder (total − sum of stages) that proves the
+  breakdown adds up (4 ms median here); the model call broken down **per attempt**, so a schema retry
+  isn't read as a slow model; kept **out of the public contract** (it's trace). The harness stores it
+  per run and reports median, p95 and share per stage. *Measured:* generation 93–94%; the 25–30% that
+  moderation + embedding showed on two requests was **cold start** — a small-N check right after
+  startup doesn't measure latency, the harness pass does. *If an instrument reuses an existing field
+  name, say it redefines it* (`db_ms` went from "the whole DB block" to "ranking only").
 - **Log metadata, not content, by default.** Structured logs capture prompts and can capture
   responses. Default to metadata (tokens, model, latency); the full prompt/response text is a
   data-exposure surface. Harmless for a public corpus, but a compliance concern (GDPR) for
@@ -1645,6 +1814,14 @@ on the provider seam (Phase 1) and the output contract (Phase 2).
   - *Applicability note:* pick by stack fit — a Pydantic/FastAPI stack pairs naturally with an
     OpenTelemetry-based tool; open-source/self-hosted needs favor others. Tools whose value is tied
     to a framework you don't use (e.g. LangChain-coupled tracers) are out by construction.
+  - *The durable decision is the standard, not the tool* *(not exercised here)*: instrument with
+    **OpenTelemetry** (spans: a named, timed unit with attributes; a trace is their parent/child tree)
+    and choose the backend later (hosted or self-hosted). LLM-only tracers see the call and its result
+    but not the seam in between (a slow query, a connection problem); full-stack tracing does.
+    *Hosted vs. self-hosted is a compliance decision:* a hosted backend receives prompts, retrieved
+    text and user questions — a public corpus doesn't make the **questions** public (a client's
+    project, export-controlled topics). And per-run cost as a query presupposes a cost attribute on
+    each span: writing it is the real work.
   - *Don't conflate two meanings of "traceability":* **operational** trace (which model, tokens,
     cost, latency, fallback, cache_hit — this phase) is not **citation** trace (which clause grounded
     which claim — a generation-quality phase). Same word, different layers; don't let a logging task
@@ -2044,6 +2221,17 @@ way — mostly in the data layer, but they generalize.
   citations from injected material, and produced unsourced `[n]` once citations came from markers;
   rewriting stored citations to natural IDs fixed stale handles and created a format the model copied.
   When you replace a mechanism, list the rules that existed *because of* it and re-justify each.
+
+- **Group a trace in its presentation, never in the logic that decides.** A trace that logs one entry
+  per mention (60+ "already searched" for one document) buries the entries that explain a decision.
+  Group only what had no effect, keep the deciding entries as they are, pin the context by digest
+  before touching the trace, and re-score the evaluation that reads it to prove it scores the same.
+
+- **A user-acceptance case must have its premise checked, and its evidence must be reconstructable.**
+  A case written as "a query with no document pointers" had one; a finding was attributed to the
+  wrong request and couldn't be re-assigned, because the log keeps metadata, not the question, and
+  was lost with the container. Check each case's premise against the deterministic context before
+  writing it, and keep the evidence with the run (the harness artifact), not in a container log.
 
 - **One measured prompt iteration, then change the lever.** With small models an exact-format
   instruction outweighs a judgment rule, and prohibitions are obeyed in the letter ("not indexed" →

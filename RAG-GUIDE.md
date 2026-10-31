@@ -1062,6 +1062,25 @@ the failure modes are named.
   naming **aspects of the user's question** ("requirements that apply only to category C"), never
   facts about the source ("category C rows in the matrix" reads as a normative absence) — and the
   sentence that presents it is composed by code, in a separate block. Voice violations went to 0.
+  - *Type the absence when the type is only known after reading the context.* On a normative corpus
+    one `not_found` list hides three different things: the material **doesn't cover** it, the material
+    **contradicts the question's premise** ("which services are mandatory?" — all are optional), or the
+    material **delegates** it to another document. No pre-generation classifier can tell them apart (the
+    false-premise question looks ordinary until the clause is read), and per-type prompt rules
+    accumulate until fixing one breaks another. *Implemented:* a `kind` per absent aspect
+    (`not_in_material` · `premise_contradicted` · `delegated`) in the output schema. The two assertive
+    kinds **require a literal quote**, verified by the same check as statements; if it fails, code
+    serves the neutral kind and logs the downgrade. Measured: the three signal cases went from 0/3 to
+    2/3, 2/3 and 3/3; 16 of 17 served typed aspects were correct, 0 false premises; `verified` stayed
+    1.00; precision −0.028; +14% latency, +12% cost.
+  - *Adopt by asymmetric error.* A missed type falls back to the previous behaviour (a plain absence);
+    a spurious one tells the user something false ("your premise is wrong"). Weigh the **precision of
+    what is served**, not recall — that is what carried adoption with one case at 2 of 5 runs.
+  - *A delegation to a document you index is a retrieval gap, not an answer.* Half the delegations
+    pointed at standards in the corpus that retrieval hadn't brought; resolving the target against the
+    corpus is deterministic and feeds reference traversal.
+  - *Typical false positive:* a sentence saying where a project **documents** something read as a
+    normative delegation.
 - **Reading rules are the CAG inside the RAG.** What belongs fixed in the system prompt of a RAG over a
   normative corpus is not content but the corpus's *grammar*: obligation keywords ("shall" requirement,
   "should" recommendation, "may" permission), informative items are not binding, an enumerated list is
@@ -1388,6 +1407,27 @@ comes second: it depends on the **shape of the flow**, agent or not.
   - *Trigger signal to reopen:* needing persistence **between steps of one request** — not between
     turns, which conversation history already covers.
 
+- **One agent or several — and what multi-agent brings.** *(not exercised here)*
+  - *Two forks in series, not one.* "Workflow or agent?" is decided by who owns control flow. "One
+    agent or several?" is decided by **saturation**: one prompt accumulating rules from different
+    domains (fixing one case breaks an unrelated one), or too many tools in one decision space. An
+    order unknown in advance needs a loop, which **one** agent provides. Responsibilities changing at
+    different rates need separate modules, not separate model calls: component ≠ agent. Before
+    splitting for tool count, filter or load tools per query.
+  - *Supervisor: hybrid by default.* Preconditions resolved by rules, the model routes only where the
+    choice is a genuine judgment; a routing budget and a decision trail from the first line (a
+    model-routed graph loops by default on an ambiguous instruction). If writing it leaves no real
+    ambiguity, there is no supervisor. The router's input is a hand-built **digest** of the state: its
+    design fixes which decisions the router can make (a count of matches hides that they're useless).
+  - *Communication is a ladder, per boundary:* shared state (default) → handoff, only when routing
+    cost is **measured** against the hybrid supervisor (against a model-routed supervisor it looks
+    cheaper than it is, and it gives each worker a second job) → messages, when agents become separate
+    services.
+  - *Reducers:* an explicit accumulate-or-overwrite policy per field. Under parallel writes, combine,
+    **deduplicate by key and order stably** — arrival order changes prompt position and makes the
+    evaluation irreproducible.
+  - *Test results and invariants, not the path.*
+
 - **Execution state and persistence (checkpointer).** *(not exercised here)*
   - *Short vs. long memory:* short-term memory is the **thread** — a multi-turn conversation, which a
     server-side turn history already is (`session_id` ≡ `thread_id`). Long-term memory is durable
@@ -1423,19 +1463,51 @@ comes second: it depends on the **shape of the flow**, agent or not.
     concurrency (rate limits); the gain holds for I/O, not CPU-bound work in one process; decide the
     policy for a failed branch (`return_exceptions` and an explicit rule for the gap).
 
-- **Errors in an orchestrated flow.** *(not exercised here, beyond the existing retry policy)*
+- **An uncertainty signal for the answer — which one depends on the output type.** *(competition not
+  exercised here)*
+  - *Judgment under uncertainty, costly error* (an estimate, a recommendation): competition — two
+    agents with **substantively different criteria and, above all, different evidence**, proposals with
+    their assumptions, divergence **computed** (not asked of a model), a synthesizer that returns a
+    range and open questions instead of averaging. Pitfalls: same model + same context + a changed
+    adjective = correlated outputs and false confidence; convergence measures robustness to the varied
+    assumptions, **not correctness** (both inherit the same upstream extraction); a weaker second model
+    inflates divergence with error. Derive the gate from the computed divergence, not from a confidence
+    the synthesizer reports. Two competitors; ×3 cost, ×~2 latency.
+  - *Factual or source-anchored output:* there is no legitimate disagreement to compete over. First a
+    deterministic check against the source (citation verification), then repeated sampling, where
+    dispersion does predict error.
+  - *Cheap error:* none.
+
+- **Errors in an orchestrated flow.** *(degradation visibility and the retry inventory exercised;
+  the rest not)*
   - *Each failure type gets its own response:* transient → retry with backoff · persistent dependency
     outage → alternative path + **circuit breaker** · crash from an external cause → resume from the
     last checkpoint · **deterministic bug → neither retry nor resume: fail fast and loud** (resuming
     re-runs the same input into the same bug) · low confidence or ambiguity → a human gate.
   - *Retries live in one layer, with a predicate.* An aggregation router that already retries plus a
     per-node retry policy multiplies calls (3 × 3 = 9 per failure); a retry without a predicate also
-    retries bugs.
+    retries bugs. *Inventory them:* measured here, router retries on the primary and on the fallback
+    times one schema retry gave a worst case of **12 provider calls per request**, and every
+    router/SDK retry turns a failure into latency with no trace in the contract.
   - *Degradation must be visible in the contract*, not only in internal state: a timed-out expansion
     recorded in an `errors` field nobody serves yields an incomplete answer that looks complete — the
-    worst outcome where omission is the costly error. Surface it through the answer status.
+    worst outcome where omission is the costly error. *Implemented:* an always-present
+    `degradations[{stage, kind, detail}]` field with a closed vocabulary, fed by an inventory of every
+    technical event on the request path (7 of 17 already reached the contract; 7 were added).
+    - *Error ≠ review, also in the contract.* Technical events (the system couldn't do its job) and
+      content judgments (a quote that didn't prove a typed absence) go to separate fields; mixing them
+      reintroduces the confusion.
+    - *Configured policy is not degradation for the user.* Truncation by a configured per-unit cap
+      appeared in 13 of 14 queries; a warning on 93% of answers gets ignored. The contract keeps
+      everything; the presentation shows only events that change how far to trust the answer
+      (references not followed, an empty routing filter, a guardrail that failed open, missing table
+      labels).
   - *Gate on a deterministic signal* (citation verification), not on a confidence the model reports
     about itself; one gate at the critical point, not one per step.
+  - *A human gate is judged by its rate and its misses.* A gate firing on most cases trains reviewers to
+    approve without looking; audit a sample of the cases it did **not** flag, or a selective gate is
+    indistinguishable from a blind one. Errors (the system couldn't do its job) never go to the human:
+    they go to retry, fallback or degradation.
 
 ## Phase 4 — Production-hardening the service (provider robustness, caching, streaming, observability)
 
@@ -2147,6 +2219,26 @@ read the maturity field, don't adopt the whole pipeline at once.
 
 ---
 
+- **Agent actions — privilege, validation, audit.** *(not exercised here: no tool with side effects)*
+  - *Applicability condition:* any tool that writes or acts outside the system. *Trigger signal:*
+    someone adds the first one.
+  - *A prompt is an instruction, not a restriction.* The model is the client: what it proposes is
+    validated in a layer it doesn't control. Classify each tool's risk (pure · read · write · external);
+    grants are data, verified at startup; concentrate writes in one small, reviewable place.
+  - *A deterministic guard between intent and execution* validates arguments, not just permission, and
+    binds every action to the current run's id (no writing on someone else's record). Irreversible
+    actions go to the human gate — a turn if the user is the approver.
+  - *Audit every side-effecting action, denials included* (a rising denial rate is the early alarm),
+    keyed by the domain id, sensitive values redacted, append-only.
+  - *Reading is not harmless* in a private or multi-tenant corpus: a read not scoped to the caller
+    leaks someone else's data. Retrieval needs the same scoping.
+
+- **Least privilege lives in the credential, not in the code that "only reads".** *Measured:* the
+  request path only reads by convention, while its single database role is a superuser owning every
+  table, shared with ingestion and migrations. A read-only role for the request path (one migration, a
+  second URL) is the real restriction; the tool list is documentation. Cheap to check; check before
+  exposure.
+
 ## Cross-cutting method (applies to every phase)
 
 These are not about *what* to build but *how to build it reliably*. They earned their place the hard
@@ -2232,6 +2324,13 @@ way — mostly in the data layer, but they generalize.
   wrong request and couldn't be re-assigned, because the log keeps metadata, not the question, and
   was lost with the container. Check each case's premise against the deterministic context before
   writing it, and keep the evidence with the run (the harness artifact), not in a container log.
+  - *Keep the verdict as a record, from day one.* The pair *what the system answered / what a human
+    judged* is the most valuable data the system produces and it cannot be recovered: of ~100 past
+    acceptance cases, none kept its response, and regenerating is useless because the verdict was
+    given on a different answer. Reason the verdict in prose; store it as a validated record linked to
+    the saved response, the config and the corpus fingerprint, with a golden-set-candidate flag.
+  - *A preregistered success rule matches the evidence **and** the aspect.* A case passed 3/3 by citing
+    the expected clause about a different part of the question.
 
 - **One measured prompt iteration, then change the lever.** With small models an exact-format
   instruction outweighs a judgment rule, and prohibitions are obeyed in the letter ("not indexed" →

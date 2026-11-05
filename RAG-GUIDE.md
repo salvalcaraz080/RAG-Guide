@@ -390,27 +390,21 @@ different stage.
   state. When the condition is met, unfreeze deliberately and update every doc that asserted the
   freeze — a freeze without a written exit condition becomes cargo-culted "don't touch."
 
-- **Graph vs. chunk-metadata for cross-references.** *(open, corpus-dependent)* Don't reach for graph
-  infrastructure because references *exist* — reach for it because the product needs to *reason over*
-  references (multi-hop paths, centrality), not merely *record* which exist. If runtime only ever
-  needs 1-hop expansion, an adjacency table (`chunk → [referenced clauses]`) + an inverse index covers
-  it without a graph object. *Applicability:* decide this only once chunking (what a chunk is, hence
-  what metadata it can carry) and extractor validation (are the references even reliable?) exist —
-  deciding earlier pre-empts the fork. *Signal it's the wrong tool:* the graph object is built but
-  production only ever consumes the flat adjacency.
-  - *Sub-fork resolved (graph object vs. adjacency index):* if runtime is 1-hop, an adjacency index
-    built from the reference list (an in-memory dict) beats a graph object (`nx.DiGraph`) — the graph
-    object is not a runtime dependency; keep it, if at all, for offline tooling/multi-hop analysis and
-    off the hot path. What's built at chunk time to make *any* of these possible is a **ref-ready
-    chunk**: it carries its own clause-ID plus its outgoing references resolved to native-granularity
-    target-IDs, and stays **agnostic to how retrieval consumes them** — the material is the same for
-    adjacency, metadata, or the third option below. (Populating those references is itself gated on
-    the extractor's validation — don't fill the slot from a stale/unvalidated extractor.)
-  - *Third fork the original framing missed:* the choice is not only "graph vs. metadata" but "graph,
-    metadata, or **bake cross-reference awareness into the embedding**" (Contextual-Retrieval-style:
-    the embed-text of a chunk names what it references, so a query about the referenced thing retrieves
-    it **without traversing** anything). It doesn't let you *walk* references at query time, but it
-    dissolves part of the need to. Records the fork; the decision stays open and corpus-dependent.
+- **Graph vs. chunk-metadata for cross-references.** *(resolved here: no graph store)* Don't reach for
+  graph infrastructure because references *exist* — reach for it because the product needs to
+  *reason over* references (multi-hop paths, centrality), not merely *follow* them. *Applicability:*
+  decide only once chunking and extractor validation exist — deciding earlier pre-empts the fork.
+  *Signal it's the wrong tool:* the graph object is built but production only ever consumes the flat
+  adjacency.
+  - *Resolved: no graph object on the request path.* With every measured answer path one hop long
+    (40 of 40 annotated paths), what production needs is **edge detection at query time over the
+    injected text** plus lookups, feeding one accumulator (Phase 3.5, *Reference graph*). A graph
+    object (`nx.DiGraph`) stays an offline analysis tool; a graph database would be pure overhead.
+    What chunk time must provide is a **ref-ready chunk**: its own unit id and structural position,
+    agnostic to how retrieval consumes them.
+  - *Third fork the original framing missed:* "graph, metadata, or **bake cross-reference awareness
+    into the embedding**" (Contextual-Retrieval-style: the embed-text names what it references).
+    *(not exercised here)* It doesn't let you walk references, but dissolves part of the need.
 
 ---
 
@@ -1147,35 +1141,75 @@ the failure modes are named.
     bounded completion). **Adopted by product priority**: in a traceability product, answering from
     guidance while the cited requirement exists is worse than a slower answer; latency became an
     objective with its own levers, not a guard.
-  - *Pointers to a **whole document** — measured, not adopted.* The cheapest rung is a conditional
-    edge, not a loop: pointer to a unit → lookup by id; pointer to a document → the **same query and
-    the same vector** re-run filtered to that document (one extra DB query, +68 ms median; skip it
-    when the document is already in the routing filter). It resolved 1 of 6 targeted gaps; a
-    retrieval-only pre-check had already bounded it at 2. The *why-not* breakdown is the lesson:
-    - **Following a pointer is not bringing something relevant.** A filtered search always returns
-      something (no distance floor), and a generic remark ("see the risk-management standard") fires
-      on every query that injects it: 207 units added in 10 of 14 queries, 100 cited, 14 judged
-      irrelevant, and in two queries none cited.
-    - **Shared slots in order of appearance starve late pointers.** A document whose answer sat at
-      rank 2 never entered, because the same text named five clauses first. Priority between pointers
-      (edge type, authority, relevance) must be an explicit decision, not an effect of text order.
-    - **Reformulating inside the target** — the step that would need a model, and the last candidate
-      for an agent loop — **had no real case**: of 5 unresolved gaps, 3 were slot policy, 1
-      generation, and the 1 query-side miss was a delegation the domain never states.
-  - *What it does not reach — the next node, not built:* **implicit** edges no text states (a clause
-    and its row in an applicability matrix; siblings under one parent; a requirement and the template
-    of its expected output), **name-based** edges (a document type named without a number → its
-    template annex), and **authority preference** (binding text over guidance in ranking). That is a
-    reference graph, decided separately. Requirements it inherits from the measurements above: a
-    **relevance gate** before following an edge (next node), **explicit priority** between edges, an
-    accumulator keyed by unit id under one budget (one unit reached by two paths enters once), and the
-    **origin** of each added unit as a contract field.
+  - *Pointers to a **whole document** — adopted on the second attempt, with a gate.* The cheapest
+    rung is a conditional edge, not a loop: pointer to a unit → lookup by id; pointer to a document →
+    the **same query and the same vector** re-run filtered to that document. First attempt (no gate,
+    slots shared with clause pointers, order of appearance) resolved 1 of 6 targets; the *why-not*
+    said: a filtered search always returns something; a generic remark fires on every query that
+    injects it; shared slots in text order starved a target at rank 2; and the reformulating loop
+    (the last candidate for an agent) had no case. Second attempt changed only the policy: a
+    **distance floor** calibrated offline (below), **own slots** (3 pointers × 3 chunks, own token
+    cap), **explicit priority** (source authority — binding text before guidance — then best admitted
+    distance, never text order). Result: +2 of 11 targets, recall and precision unchanged, every
+    negative uncited, +21 ms. Adopted by error asymmetry: a small gain with no measurable loss.
+  - *More depth inside the target is not the lever.* Opening the target (10 candidates, 10 chunks per
+    pointer) brought the relevant unit in and the generator did not use it (ten units of one document
+    competing), and brought a courtesy pointer's noise in and the generator **did** cite it. Not
+    adopted. Past that point the problem is **selection and use**, not reach. (Its first variant
+    measured nothing: raising candidates without raising the per-pointer chunk cap left the binding
+    cap unchanged — find the binding cap before opening another.)
+
+- **Reference graph — which edges, one accumulator.**
+  - *Applicability condition:* a corpus with explicit structure (numbered units, annexes, templates,
+    applicability matrices) **and** references between units. If units are flat and references
+    rare, there is nothing to traverse.
+  - *Two families, only one fits a traceability product.* An **LLM-extracted knowledge graph** with
+    community summaries (GraphRAG-style) answers *global* questions over unstructured text, at high
+    build cost, and puts generated summaries in the prompt — contraindicated where every sentence must
+    trace to literal text. A **structural/citation graph** uses edges the documents already state and
+    answers *local* questions ("what else does this unit oblige me to read?"). Personalized PageRank or
+    LLM-guided walks *(not exercised here)* pay off on large, dense graphs, not on hundreds of one-hop
+    edges.
+  - *Measure reachability per edge type before building any.* Annotate, per question, the **path**:
+    source unit, answer unit, edge type, hops, a literal quote at each end. Then, without generation,
+    classify every answer: reached / not retrieved / source not in context / edge not detected / edge
+    detected but not followed / over the slot limit. Measured on 36 targets: **document pointers** 10
+    of 11 not followed (the real gap); **implicit structural edges** (requirement → its output
+    template, parent/sibling) 6 of 6 already reached by plain retrieval — no edge worth building;
+    applicability rows 2 failures with n = 3; **name edges** 3 not detected. Two of five planned
+    techniques were pruned before writing code.
+  - *One accumulator before the second channel.* Every channel (retrieval, completion, clause
+    pointers, document pointers, names) hands candidates to one accumulator keyed by unit id: dedupe,
+    a **declarative order** (channel precedence, rank in its slot, position — never arrival order,
+    since order fixes the handles), a precedence rule for the winning origin when a unit arrives by two
+    paths (others kept), per-channel caps, and a hop budget. Each added unit carries
+    `origin`/`edge_kind`/`from_clause`/`hop` in the contract. Ship it as a pure refactor accepted by a
+    **byte-identical context digest** on every configuration.
+  - *Name edges — a document type named without a number.* A deterministic dictionary from the
+    template annexes' own titles (full name + acronym in parentheses; longest overlapping mention
+    wins; ambiguous names not followed) detected all three targets with no LLM — and the shared
+    distance gate stopped two of them. Built and left off. A narrow target (one annex) is more
+    reliable than a whole document and deserves **its own** gate. Early signal: a name edge can stand
+    in for a second hop (one case).
+  - *Trigger signal:* generator gaps that point to a unit **in the corpus but not injected** — classify
+    every "delegated to another document" gap by whether its target is out of corpus, injected, or in
+    corpus and not injected; only the last class is a retrieval/graph miss.
+  - *Hops:* start at one, explicit; add the second only with annotated two-hop cases (none here).
 
 - **Relevance gate for added context — threshold, cross-encoder or LLM judge.** *(rungs 2–3 not
   exercised here)*
   - *Applicability condition:* any mechanism that adds context by rule rather than by ranking
     (completion, reference traversal, a graph) and can therefore add irrelevant units.
   - *Trigger signal:* budget cuts on added context, or added units the generator never cites.
+  - *Rung 1, measured (distance floor on document pointers).* Calibrate once, offline, on the
+    golden set's judgments over the channel's candidates (judge every unjudged candidate first —
+    blind): pick the **most permissive** threshold at which what it admits is at least as precise as
+    what retrieval already serves (here 0.48 → threshold 0.3758; 0.3991 with deeper candidates). It
+    worked as a floor and showed its limit: an **absolute** distance does not separate a useful target
+    from a courtesy pointer when the whole target document is close to the query, and it shuts out a
+    rank-2 answer at 0.46. State that it is in-sample, and that query embeddings jitter in the fourth
+    decimal between runs. Next rungs: a threshold relative to the target, or a cross-encoder on
+    *added* units only.
   - *Rungs, cheapest first:* a **distance floor** on what an edge brings → a **cross-encoder** score
     (Phase 3.5 measured one that failed on hard negatives; re-measure on *added* units, not the base
     ranking) → an **LLM judge**: one structured call that returns the ids to keep. The judge is a
@@ -1278,6 +1312,11 @@ generation adds: **noise**, **asymmetry** and **degenerate strategies**.
   the context. That pre-check put the ceiling at 2 of 6 against a criterion of 3, before any model
   call; the pass gave 1. Measure anyway (the guards, the per-stage latency and the why-not breakdown
   are the output), but tune nothing to the pre-check.
+- **Count what the technique *gains* over control, not what it *reaches*.** A ceiling written as
+  "targets the variant reaches" included one that control already resolved, and let a pass be paid
+  with less headroom than intended. Preregister the ceiling as reached-by-variant **and not** by
+  control, stop before generating if it is below the bar, and add a guard that what control already
+  resolves stays resolved.
 - **Report *why not* per unresolved target, by cause.** "Not detected / not resolved / over the slot
   limit / not in the slot / brought but not cited / cut by budget" turns a failed criterion into the
   specification of the next step — here it showed the expensive option (a reformulating loop) had no
